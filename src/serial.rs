@@ -15,6 +15,148 @@ use nix::{
 };
 use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
+pub struct SerialPort {
+    inner: AsyncFd<TtyDevice>,
+}
+
+impl SerialPort {
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let tty = TtyDevice::open(path)?;
+
+        //Make the file descriptor non-blocking
+        let fd = tty.as_raw_fd();
+        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
+        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+
+        Ok(Self {
+            inner: AsyncFd::new(tty)?,
+        })
+    }
+
+    pub fn with_options() -> SerialPortOptions {
+        SerialPortOptions::default()
+    }
+}
+
+impl AsyncRead for SerialPort {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            let mut guard = ready!(self.inner.poll_read_ready_mut(cx))?;
+
+            match guard.try_io(|inner| inner.get_mut().read(buf.initialize_unfilled())) {
+                Ok(Ok(bytes_read)) => {
+                    buf.advance(bytes_read);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(err)) => {
+                    return Poll::Ready(Err(err));
+                }
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SerialPort {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.inner.poll_write_ready_mut(cx))?;
+
+            match guard.try_io(|inner| inner.get_mut().write(buf)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.get_mut().flush()?;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialPortOptions {
+    baud_rate: u32,
+    data_bits: DataBits,
+    stop_bits: StopBits,
+    parity: Parity,
+}
+
+impl Default for SerialPortOptions {
+    fn default() -> Self {
+        Self {
+            baud_rate: 115200,
+            data_bits: DataBits::Eight,
+            stop_bits: StopBits::One,
+            parity: Parity::None,
+        }
+    }
+}
+
+impl SerialPortOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn baud_rate(&mut self, baud_rate: u32) -> &mut Self {
+        self.baud_rate = baud_rate;
+        self
+    }
+
+    pub fn data_bits(&mut self, data_bits: DataBits) -> &mut Self {
+        self.data_bits = data_bits;
+        self
+    }
+
+    pub fn stop_bits(&mut self, stop_bits: StopBits) -> &mut Self {
+        self.stop_bits = stop_bits;
+        self
+    }
+
+    pub fn parity(&mut self, parity: Parity) -> &mut Self {
+        self.parity = parity;
+        self
+    }
+
+    pub fn open<P: AsRef<Path>>(self, path: P) -> io::Result<SerialPort> {
+        SerialPort::open(path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataBits {
+    Five,
+    Six,
+    Seven,
+    Eight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopBits {
+    One,
+    Two,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parity {
+    None,
+    Even,
+    Odd,
+}
+
 #[derive(Debug)]
 
 struct TtyDevice {
@@ -93,100 +235,4 @@ impl io::Write for TtyDevice {
     fn flush(&mut self) -> io::Result<()> {
         termios::tcdrain(self.fd).map_err(io::Error::from)
     }
-}
-
-pub struct SerialPort {
-    inner: AsyncFd<TtyDevice>,
-}
-
-impl SerialPort {
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let tty = TtyDevice::open(path)?;
-
-        //Make the file descriptor non-blocking
-        let fd = tty.as_raw_fd();
-        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
-        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-
-        Ok(Self {
-            inner: AsyncFd::new(tty)?,
-        })
-    }
-}
-
-impl AsyncRead for SerialPort {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_read_ready_mut(cx))?;
-
-            match guard.try_io(|inner| inner.get_mut().read(buf.initialize_unfilled())) {
-                Ok(Ok(bytes_read)) => {
-                    buf.advance(bytes_read);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(err)) => {
-                    return Poll::Ready(Err(err));
-                }
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-impl AsyncWrite for SerialPort {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_write_ready_mut(cx))?;
-
-            match guard.try_io(|inner| inner.get_mut().write(buf)) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.get_mut().flush()?;
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-pub struct SerialPortOptions {
-    _baud_rate: u32,
-    _data_bits: DataBits,
-    _stop_bits: StopBits,
-    _parity: Parity,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DataBits {
-    Five,
-    Six,
-    Seven,
-    Eight,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum StopBits {
-    One,
-    Two,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Parity {
-    None,
-    Even,
-    Odd,
 }
