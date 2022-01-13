@@ -9,11 +9,13 @@ use std::{
 use futures::ready;
 use nix::{
     fcntl::{self, FcntlArg, OFlag},
-    sys::termios::{self, ControlFlags, FlushArg, InputFlags, SetArg},
-    sys::{stat::Mode, termios::BaudRate},
+    sys::stat::Mode,
+    sys::{self, termios::ControlFlags},
     unistd,
 };
 use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::termios::Termios;
 
 pub struct SerialPort {
     inner: AsyncFd<TtyDevice>,
@@ -21,20 +23,69 @@ pub struct SerialPort {
 
 impl SerialPort {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let tty = TtyDevice::open(path)?;
-
-        //Make the file descriptor non-blocking
-        let fd = tty.as_raw_fd();
-        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
-        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-
-        Ok(Self {
-            inner: AsyncFd::new(tty)?,
-        })
+        Self::with_options().open(path)
     }
 
     pub fn with_options() -> SerialPortOptions {
         SerialPortOptions::default()
+    }
+
+    fn open_with_options<P: AsRef<Path>>(path: P, opts: SerialPortOptions) -> io::Result<Self> {
+        let tty = TtyDevice::open(path)?;
+
+        //Make the file descriptor non-blocking
+        // SAFETY: the bitfield retrieved with F_GETFL is assumed to be always valid.
+        let fd = tty.as_raw_fd();
+        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
+        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+
+        let mut port = Self {
+            inner: AsyncFd::new(tty)?,
+        };
+
+        // Configure port parameters
+        port.set_baud_rate(opts.baud_rate)?;
+        port.set_data_bits(opts.data_bits)?;
+        port.set_parity(opts.parity)?;
+        port.set_stop_bits(opts.stop_bits)?;
+        port.set_flow_control(FlowControl::None)?;
+
+        Ok(port)
+    }
+
+    pub fn set_baud_rate(&mut self, baud_rate: u32) -> io::Result<()> {
+        let fd = self.inner.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_baud_rate(baud_rate)?;
+        termios.apply(fd)
+    }
+
+    pub fn set_data_bits(&mut self, data_bits: DataBits) -> io::Result<()> {
+        let fd = self.inner.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_data_bits(data_bits);
+        termios.apply(fd)
+    }
+
+    pub fn set_stop_bits(&mut self, stop_bits: StopBits) -> io::Result<()> {
+        let fd = self.inner.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_stop_bits(stop_bits);
+        termios.apply(fd)
+    }
+
+    pub fn set_parity(&mut self, parity: Parity) -> io::Result<()> {
+        let fd = self.inner.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_parity(parity);
+        termios.apply(fd)
+    }
+
+    pub fn set_flow_control(&mut self, flow_control: FlowControl) -> io::Result<()> {
+        let fd = self.inner.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_flow_control(flow_control);
+        termios.apply(fd)
     }
 }
 
@@ -132,7 +183,7 @@ impl SerialPortOptions {
     }
 
     pub fn open<P: AsRef<Path>>(self, path: P) -> io::Result<SerialPort> {
-        SerialPort::open(path)
+        SerialPort::open_with_options(path, self)
     }
 }
 
@@ -157,8 +208,14 @@ pub enum Parity {
     Odd,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowControl {
+    None,
+    Software,
+    Hardware,
+}
 
+#[derive(Debug)]
 struct TtyDevice {
     fd: RawFd,
 }
@@ -171,34 +228,16 @@ impl TtyDevice {
             Mode::empty(),
         )?;
 
-        let mut termios = termios::tcgetattr(fd)?;
+        let mut termios = Termios::from_raw_fd(fd)?;
 
-        termios.control_flags |= ControlFlags::CREAD | ControlFlags::CLOCAL;
+        // Set control flags required for a TTY device
+        termios.as_mut().control_flags |= ControlFlags::CREAD | ControlFlags::CLOCAL;
 
-        termios::cfmakeraw(&mut termios);
-
-        // Data bits: 8
-        termios.control_flags &= !ControlFlags::CSIZE;
-        termios.control_flags |= ControlFlags::CS8;
-
-        // Parity: none
-        termios.control_flags &= !(ControlFlags::PARENB | ControlFlags::PARODD);
-        termios.input_flags &= !InputFlags::IGNPAR;
-
-        // Stop bits: 1
-        termios.control_flags &= !ControlFlags::CSTOPB;
-
-        // Flow control: none
-        termios.control_flags &= !ControlFlags::CRTSCTS;
-        termios.input_flags &= !(InputFlags::IXON | InputFlags::IXOFF);
-
-        // Baudrate: 115200
-        termios::cfsetispeed(&mut termios, BaudRate::B115200)?;
-        termios::cfsetospeed(&mut termios, BaudRate::B115200)?;
+        // Configure port in raw mode: we don't want any processing going on under the hood
+        termios.make_raw();
 
         // Apply settings
-        termios::tcflush(fd, FlushArg::TCIFLUSH)?;
-        termios::tcsetattr(fd, SetArg::TCSANOW, &termios)?;
+        termios.apply(fd)?;
 
         // Clear O_NONBLOCK flag.
         // SAFETY: the bitfield retrieved with F_GETFL is assumed to be always valid.
@@ -233,6 +272,6 @@ impl io::Write for TtyDevice {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        termios::tcdrain(self.fd).map_err(io::Error::from)
+        sys::termios::tcdrain(self.fd).map_err(io::Error::from)
     }
 }

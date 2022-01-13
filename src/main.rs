@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod serial;
+mod termios;
 pub mod tty;
 
 #[derive(Debug, StructOpt)]
