@@ -345,7 +345,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusty"
+name = "rutty"
 version = "0.1.0"
 dependencies = [
  "anyhow",
