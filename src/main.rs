@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     terminal.make_raw()?;
 
     'repl: loop {
-        let mut bufin = [0; 1];
+        let mut bufin = [0; 256];
         let mut bufout = [0; 256];
 
         select! {
