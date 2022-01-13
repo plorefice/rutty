@@ -1,50 +1,102 @@
-use std::{fs::File, io::Read, os::unix::prelude::FromRawFd};
-
-use nix::{
-    fcntl::OFlag,
-    sys::termios::{
-        self, ControlFlags, FlushArg, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
-    },
-    sys::{stat::Mode, termios::BaudRate},
+use std::{
+    io::{self, Write},
+    path::PathBuf,
 };
 
-fn main() {
-    let port = std::env::args().nth(1).unwrap();
+use anyhow::Context;
+use nix::{
+    libc::STDIN_FILENO,
+    sys::{
+        self,
+        termios::{FlushArg, SetArg, SpecialCharacterIndices},
+    },
+};
+use structopt::StructOpt;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    select,
+};
 
-    let fd = nix::fcntl::open(
-        port.as_str(),
-        OFlag::O_NOCTTY | OFlag::O_RDWR,
-        Mode::empty(),
-    )
-    .unwrap();
+use crate::serial::SerialPort;
 
-    let old_tio = termios::tcgetattr(fd).unwrap();
+pub mod serial;
+mod termios;
 
-    let mut new_tio = old_tio.clone();
+#[derive(Debug, StructOpt)]
+#[structopt(name = env!("CARGO_PKG_NAME"), about = env!("CARGO_PKG_DESCRIPTION"))]
+struct Opts {
+    /// Device to connect to
+    #[structopt(parse(from_os_str))]
+    device: PathBuf,
+}
 
-    new_tio.control_flags = ControlFlags::CS8 | ControlFlags::CLOCAL | ControlFlags::CREAD;
-    new_tio.input_flags = InputFlags::IGNPAR | InputFlags::ICRNL;
-    new_tio.output_flags = OutputFlags::empty();
-    new_tio.local_flags = LocalFlags::empty();
-    new_tio.control_chars = [0; 32];
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let opts = Opts::from_args();
 
-    new_tio.control_chars[SpecialCharacterIndices::VMIN as usize] = 1; /* blocking read until 1 character arrives */
+    let mut port = SerialPort::open(&opts.device)
+        .with_context(|| format!("Could not open {}", &opts.device.display()))?;
 
-    termios::cfmakeraw(&mut new_tio);
-    termios::cfsetospeed(&mut new_tio, BaudRate::B115200).unwrap();
+    let term_state = make_raw(STDIN_FILENO)?;
 
-    termios::tcflush(fd, FlushArg::TCIFLUSH).unwrap();
-    termios::tcsetattr(fd, termios::SetArg::TCSANOW, &new_tio).unwrap();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = std::io::stdout();
 
-    let mut port = unsafe { File::from_raw_fd(fd) };
+    let mut exiter = EscapeDetector::default();
 
-    loop {
-        let mut buf = [0; 256];
+    'repl: loop {
+        let mut bufin = [0; 1];
+        let mut bufout = [0; 256];
 
-        let n = port.read(&mut buf[..]).unwrap();
+        select! {
+            n = stdin.read(&mut bufin) => {
+                let n = n?;
 
-        print!("{}", String::from_utf8_lossy(&buf[..n]));
+                // Break from the loop if the escape sequence is detected
+                if bufin[..n].iter().any(|&b| exiter.feed(b)) {
+                    break 'repl;
+                }
+
+                port.write_all(&bufin[..n]).await?;
+            }
+            n = port.read(&mut bufout) => {
+                stdout.write_all(&bufout[..n?])?;
+                stdout.flush()?;
+            }
+        }
     }
 
-    termios::tcsetattr(fd, termios::SetArg::TCSANOW, &old_tio).unwrap();
+    sys::termios::tcsetattr(STDIN_FILENO, SetArg::TCSANOW, &term_state)?;
+
+    Ok(())
+}
+
+fn make_raw(fd: i32) -> io::Result<sys::termios::Termios> {
+    let mut termios = sys::termios::tcgetattr(fd)?;
+    let old_state = termios.clone();
+
+    sys::termios::cfmakeraw(&mut termios);
+
+    termios.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
+
+    sys::termios::tcflush(fd, FlushArg::TCIFLUSH)?;
+    sys::termios::tcsetattr(fd, SetArg::TCSANOW, &termios)?;
+
+    Ok(old_state)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EscapeDetector(u32);
+
+impl EscapeDetector {
+    const ESCAPE_BYTE: u8 = b'\x01';
+
+    pub fn feed(&mut self, byte: u8) -> bool {
+        if byte == Self::ESCAPE_BYTE {
+            self.0 += 1;
+        } else {
+            self.0 = 0;
+        }
+        self.0 == 3
+    }
 }
