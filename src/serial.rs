@@ -8,7 +8,7 @@ use std::{
 
 use futures::ready;
 use nix::{
-    fcntl::{self, OFlag},
+    fcntl::{self, FcntlArg, OFlag},
     sys::termios::{self, ControlFlags, FlushArg, InputFlags, SetArg},
     sys::{stat::Mode, termios::BaudRate},
     unistd,
@@ -58,9 +58,10 @@ impl TtyDevice {
         termios::tcflush(fd, FlushArg::TCIFLUSH)?;
         termios::tcsetattr(fd, SetArg::TCSANOW, &termios)?;
 
-        // Clear O_NONBLOCK flag
-        // TODO: leave this here and set it as non-blocking in the AsyncSerialPort
-        //fcntl::fcntl(fd, FcntlArg::F_SETFL(OFlag::empty()))?;
+        // Clear O_NONBLOCK flag.
+        // SAFETY: the bitfield retrieved with F_GETFL is assumed to be always valid.
+        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
+        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
 
         Ok(Self { fd })
     }
@@ -100,8 +101,15 @@ pub struct SerialPort {
 
 impl SerialPort {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let tty = TtyDevice::open(path)?;
+
+        //Make the file descriptor non-blocking
+        let fd = tty.as_raw_fd();
+        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
+        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+
         Ok(Self {
-            inner: AsyncFd::new(TtyDevice::open(path)?)?,
+            inner: AsyncFd::new(tty)?,
         })
     }
 }
