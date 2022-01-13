@@ -1,26 +1,16 @@
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::{io::Write, path::PathBuf};
 
-use anyhow::Context;
-use nix::{
-    libc::STDIN_FILENO,
-    sys::{
-        self,
-        termios::{FlushArg, SetArg, SpecialCharacterIndices},
-    },
-};
+use anyhow::{Context, Result};
 use structopt::StructOpt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
 };
 
-use crate::serial::SerialPort;
+use crate::{serial::SerialPort, tty::Terminal};
 
 pub mod serial;
-mod termios;
+pub mod tty;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = env!("CARGO_PKG_NAME"), about = env!("CARGO_PKG_DESCRIPTION"))]
@@ -31,25 +21,23 @@ struct Opts {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let opts = Opts::from_args();
 
     let mut port = SerialPort::open(&opts.device)
         .with_context(|| format!("Could not open {}", &opts.device.display()))?;
 
-    let term_state = make_raw(STDIN_FILENO)?;
-
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = std::io::stdout();
-
+    let mut terminal = Terminal::new(tokio::io::stdin(), std::io::stdout())?;
     let mut exiter = EscapeDetector::default();
+
+    terminal.make_raw()?;
 
     'repl: loop {
         let mut bufin = [0; 1];
         let mut bufout = [0; 256];
 
         select! {
-            n = stdin.read(&mut bufin) => {
+            n = terminal.read(&mut bufin) => {
                 let n = n?;
 
                 // Break from the loop if the escape sequence is detected
@@ -60,29 +48,13 @@ async fn main() -> anyhow::Result<()> {
                 port.write_all(&bufin[..n]).await?;
             }
             n = port.read(&mut bufout) => {
-                stdout.write_all(&bufout[..n?])?;
-                stdout.flush()?;
+                terminal.write_all(&bufout[..n?])?;
+                terminal.flush()?;
             }
         }
     }
 
-    sys::termios::tcsetattr(STDIN_FILENO, SetArg::TCSANOW, &term_state)?;
-
     Ok(())
-}
-
-fn make_raw(fd: i32) -> io::Result<sys::termios::Termios> {
-    let mut termios = sys::termios::tcgetattr(fd)?;
-    let old_state = termios.clone();
-
-    sys::termios::cfmakeraw(&mut termios);
-
-    termios.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-
-    sys::termios::tcflush(fd, FlushArg::TCIFLUSH)?;
-    sys::termios::tcsetattr(fd, SetArg::TCSANOW, &termios)?;
-
-    Ok(old_state)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
