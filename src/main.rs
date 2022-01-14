@@ -1,6 +1,7 @@
 use std::{io::Write, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use colored::Colorize;
 use structopt::StructOpt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -51,8 +52,9 @@ struct Opts {
     ///
     /// If canonical mode is enabled, nothing will be sent until a whole line has been input and
     /// the return character has been pressed. This allows for local line editing before sending.
-    ///
     /// This option is mostly used in conjunction with the local echo option.
+    ///
+    /// When using this option, Return must be pressed after the escape sequence to quit.
     #[structopt(short = "C", long = "canonical")]
     canonical: bool,
 }
@@ -80,6 +82,13 @@ async fn main() -> Result<()> {
     // Process options
     terminal.set_local_echo(opts.local_echo)?;
     terminal.set_canonical_mode(opts.canonical)?;
+
+    // Usage instructions
+    writeln!(
+        terminal,
+        "{}",
+        "Connection established. Press CTRL-A three times to quit.".bold()
+    )?;
 
     'repl: loop {
         let mut bufin = [0; 256];
