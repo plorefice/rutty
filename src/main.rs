@@ -1,7 +1,6 @@
 use std::io::Write;
 
 use anyhow::{anyhow, Context, Result};
-use colored::Colorize;
 use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -32,15 +31,14 @@ async fn main() -> Result<()> {
 
     let mut terminal = Terminal::new(tokio::io::stdin(), std::io::stdout())?;
 
-    // Start with a raw mode TTY and start build up from that
-    terminal.make_raw()?;
-
     let mut remote: Box<dyn AsyncReadWrite> = match opts.connection {
         Connection::Serial {
             device,
             baud_rate,
             parameters,
         } => {
+            writeln!(terminal, "Opening {}...", &device.display())?;
+
             let (bits, parity, stops) = cli::parse_serial_parameters(&parameters)
                 .ok_or_else(|| anyhow!("Invalid parameter string: {}", parameters))?;
 
@@ -59,6 +57,8 @@ async fn main() -> Result<()> {
             Box::new(port)
         }
         Connection::Tcp { address } => {
+            writeln!(terminal, "Connecting to {}...", address)?;
+
             let stream = TcpStream::connect(&address)
                 .await
                 .with_context(|| format!("Could not connect to {}", &address))?;
@@ -68,11 +68,10 @@ async fn main() -> Result<()> {
     };
 
     // Usage instructions
-    writeln!(
-        terminal,
-        "{}",
-        "Connection established. Press ^] to quit.\r".bold()
-    )?;
+    writeln!(terminal, "Connected, press ^] to quit.\n")?;
+
+    // Start with a raw mode TTY and start build up from that
+    terminal.make_raw()?;
 
     // Process TTY options
     terminal.set_local_echo(opts.local_echo.into())?;
