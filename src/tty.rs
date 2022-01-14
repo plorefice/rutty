@@ -1,20 +1,16 @@
 use std::{
     io::{self, Write},
-    os::unix::prelude::{AsRawFd, RawFd},
+    os::unix::prelude::AsRawFd,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use futures::ready;
-use nix::{
-    sys::{
-        self,
-        termios::{FlushArg, SetArg, SpecialCharacterIndices, Termios},
-    },
-    unistd,
-};
+use nix::{sys::termios::SpecialCharacterIndices, unistd};
 use pin_project::{pin_project, pinned_drop};
 use tokio::io::{AsyncRead, ReadBuf};
+
+use crate::termios::Termios;
 
 #[pin_project(PinnedDrop)]
 pub struct Terminal<I, O>
@@ -52,33 +48,31 @@ where
             return Err(io::Error::new(io::ErrorKind::Other, "not a TTY"));
         }
 
-        let mut termios = sys::termios::tcgetattr(fd)?;
+        let mut termios = Termios::from_raw_fd(fd)?;
 
         // Push the current state in order to restore it on drop
         self.saved_state = Some(termios.clone());
 
-        sys::termios::cfmakeraw(&mut termios);
+        // Put terminal in raw mode and block until a single character is detected
+        termios.make_raw();
+        termios.as_mut().control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
 
-        termios.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-
-        sys::termios::tcflush(fd, FlushArg::TCIFLUSH)?;
-        sys::termios::tcsetattr(fd, SetArg::TCSANOW, &termios)?;
-
-        Ok(())
+        termios.apply(fd)
     }
 
     pub fn restore(&mut self) -> io::Result<()> {
         if let Some(termios) = self.saved_state.take() {
-            Self::apply_termios_to_fd(self.input.as_raw_fd(), &termios)?;
+            termios.apply(self.input.as_raw_fd())?;
         }
 
         Ok(())
     }
 
-    fn apply_termios_to_fd(fd: RawFd, termios: &Termios) -> io::Result<()> {
-        sys::termios::tcflush(fd, FlushArg::TCIFLUSH)?;
-        sys::termios::tcsetattr(fd, SetArg::TCSANOW, termios)?;
-        Ok(())
+    pub fn set_local_echo(&mut self, on: bool) -> io::Result<()> {
+        let fd = self.input.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_local_echo(on);
+        termios.apply(fd)
     }
 }
 
@@ -92,7 +86,7 @@ where
 
         // Restore the previous terminal state in case the terminal was put in raw mode
         if let Some(termios) = this.saved_state {
-            Self::apply_termios_to_fd(this.input.as_raw_fd(), termios).ok();
+            termios.apply(this.input.as_raw_fd()).ok();
         }
     }
 }

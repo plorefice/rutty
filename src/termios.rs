@@ -2,12 +2,12 @@ use std::{io, os::unix::prelude::AsRawFd};
 
 use nix::sys::{
     self,
-    termios::{BaudRate, ControlFlags, FlushArg, InputFlags, SetArg},
+    termios::{BaudRate, ControlFlags, FlushArg, InputFlags, LocalFlags, SetArg},
 };
 
 use crate::serial::{DataBits, FlowControl, Parity, StopBits};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Termios {
     inner: sys::termios::Termios,
 }
@@ -130,6 +130,14 @@ impl Termios {
                 self.inner.input_flags -= InputFlags::IXON | InputFlags::IXOFF;
                 self.inner.control_flags |= ControlFlags::CRTSCTS;
             }
+        }
+    }
+
+    pub fn set_local_echo(&mut self, local_echo: bool) {
+        if local_echo {
+            self.inner.local_flags |= LocalFlags::ECHO;
+        } else {
+            self.inner.local_flags -= LocalFlags::ECHO;
         }
     }
 }

@@ -30,6 +30,10 @@ struct Opts {
     /// Configuration string for data bits, parity and stop bits.
     #[structopt(default_value = "8N1")]
     parameters: String,
+
+    /// Enable local echo, printing all characters typed back on the terminal.
+    #[structopt(short = "E", long = "echo")]
+    local_echo: bool,
 }
 
 #[tokio::main]
@@ -51,6 +55,11 @@ async fn main() -> Result<()> {
     let mut exiter = EscapeDetector::default();
 
     terminal.make_raw()?;
+
+    // Process options
+    if opts.local_echo {
+        terminal.set_local_echo(true)?;
+    }
 
     'repl: loop {
         let mut bufin = [0; 256];
