@@ -1,4 +1,4 @@
-use std::{io::Write, path::PathBuf, str::FromStr};
+use std::io::Write;
 
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
@@ -10,121 +10,15 @@ use tokio::{
 };
 
 use crate::{
-    serial::{DataBits, Parity, SerialPort, StopBits},
+    cli::{Connection, EscapeDetector, Opts, TristateOpt},
+    serial::SerialPort,
     tty::Terminal,
 };
 
+pub mod cli;
 pub mod serial;
-mod termios;
+pub mod termios;
 pub mod tty;
-
-// If this byte is detected as input, the program will quit.
-const ESCAPE_BYTE: u8 = 0x1d;
-
-#[derive(Debug, StructOpt)]
-#[structopt(name = env!("CARGO_PKG_NAME"), about = env!("CARGO_PKG_DESCRIPTION"))]
-struct Opts {
-    /// Protocol to use to connect to the remote host.
-    #[structopt(subcommand)]
-    connection: Connection,
-
-    /// Print all characters typed back on the terminal.
-    ///
-    /// When local echo is enabled, all characters typed in the terminal are automatically echoed
-    /// back to the user. If canonical mode is also enabled, special control characters such as
-    /// ERASE and NL will behave as expected. If not, only the corresponding representation will be
-    /// echoed back, without any effect on the previously echoed characters.
-    ///
-    /// When local echo is disabled, any character typed in the terminal is printed back only if
-    /// the remote host is programmed to do so. Some remote hosts however do not provide this
-    /// functionality, in which cases local echo provides a visual feedback of each character
-    /// typed.
-    ///
-    /// Local echo is enabled by default for most protocols, and disabled only for connections
-    /// over serial port.
-    #[structopt(short = "E", long = "echo", default_value = "auto")]
-    local_echo: Tristate<true>,
-
-    /// Proocess input line by line.
-    ///
-    /// When canonical mode is enabled, nothing will be sent until the return key is pressed, at
-    /// which point the whole line of text is sent at once. This allows for local line editing
-    /// before sending, without the remote host ever seeing the intermediate edits.
-    ///
-    /// When canonical mode is disabled (also called "raw" mode), each character typed in
-    /// the terminal is immediately sent to the remote host, without any preprocessing.
-    ///
-    /// Canonical mode is enabled by default for most protocols, and disabled only for connections
-    /// over serial port.
-    #[structopt(short = "C", long = "canonical", default_value = "auto")]
-    canonical: Tristate<true>,
-}
-
-/// A type of CLI flag that can be either forced on, off or be in a default state.
-///
-/// The default state is selected at compile time using a const-generic bool parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StructOpt)]
-enum Tristate<const DEFAULT: bool> {
-    On,
-    Off,
-    Auto,
-}
-
-impl<const DEFAULT: bool> FromStr for Tristate<DEFAULT> {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "on" => Ok(Self::On),
-            "off" => Ok(Self::Off),
-            "auto" => Ok(Self::Auto),
-            _ => Err("tristate options must be one of \"on\", \"off\" or \"auto\""),
-        }
-    }
-}
-
-impl<const DEFAULT: bool> From<Tristate<DEFAULT>> for bool {
-    fn from(o: Tristate<DEFAULT>) -> Self {
-        match o {
-            Tristate::On => true,
-            Tristate::Off => false,
-            Tristate::Auto => DEFAULT,
-        }
-    }
-}
-
-impl<const DEFAULT: bool> Tristate<DEFAULT> {
-    pub fn prefer(&mut self, state: Tristate<DEFAULT>) {
-        if *self == Self::Auto {
-            *self = state;
-        }
-    }
-}
-
-#[derive(Debug, StructOpt)]
-enum Connection {
-    /// Open a serial connection on the specified device file.
-    Serial {
-        /// Device to connect to.
-        #[structopt(parse(from_os_str))]
-        device: PathBuf,
-
-        /// Communication speed in bits per second.
-        #[structopt(default_value = "115200")]
-        baud_rate: u32,
-
-        /// Configuration string for data bits, parity and stop bits.
-        #[structopt(default_value = "8N1")]
-        parameters: String,
-    },
-    /// Open a raw TCP stream towards the specified host.
-    Tcp {
-        /// Address and port of the remote host.
-        ///
-        /// Supported formats are <ip>:<port> and <uri>:<port>.
-        address: String,
-    },
-}
 
 /// Utility trait which encapsulates a read/write async stream that can be unpinned.
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
@@ -147,7 +41,7 @@ async fn main() -> Result<()> {
             baud_rate,
             parameters,
         } => {
-            let (bits, parity, stops) = parse_parameter_string(&parameters)
+            let (bits, parity, stops) = cli::parse_serial_parameters(&parameters)
                 .ok_or_else(|| anyhow!("Invalid parameter string: {}", parameters))?;
 
             let port = SerialPort::with_options()
@@ -159,8 +53,8 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Could not open {}", &device.display()))?;
 
             // Use a raw TTY with no local echo over serial port by default
-            opts.canonical.prefer(Tristate::Off);
-            opts.local_echo.prefer(Tristate::Off);
+            opts.canonical.prefer(TristateOpt::Off);
+            opts.local_echo.prefer(TristateOpt::Off);
 
             Box::new(port)
         }
@@ -209,45 +103,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn parse_parameter_string(s: &str) -> Option<(DataBits, Parity, StopBits)> {
-    let mut chars = s.chars();
-
-    let bits = match chars.next()? {
-        '5' => DataBits::Five,
-        '6' => DataBits::Six,
-        '7' => DataBits::Seven,
-        '8' => DataBits::Eight,
-        _ => return None,
-    };
-
-    let parity = match chars.next()? {
-        'N' | 'n' => Parity::None,
-        'E' | 'e' => Parity::Even,
-        'O' | 'o' => Parity::Odd,
-        _ => return None,
-    };
-
-    let stops = match chars.next()? {
-        '1' => StopBits::One,
-        '2' => StopBits::Two,
-        _ => return None,
-    };
-
-    Some((bits, parity, stops))
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct EscapeDetector(u32);
-
-impl EscapeDetector {
-    pub fn feed(&mut self, byte: u8) -> bool {
-        if byte == ESCAPE_BYTE {
-            self.0 += 1;
-        } else {
-            self.0 = 0;
-        }
-        self.0 == 1
-    }
 }

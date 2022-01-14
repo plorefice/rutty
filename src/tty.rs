@@ -10,7 +10,7 @@ use nix::{sys::termios::SpecialCharacterIndices, unistd};
 use pin_project::{pin_project, pinned_drop};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::{termios::Termios, ESCAPE_BYTE};
+use crate::{cli::ESCAPE_BYTE, termios::Termios};
 
 #[pin_project(PinnedDrop)]
 pub struct Terminal<I, O>
