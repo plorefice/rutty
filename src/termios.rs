@@ -134,18 +134,16 @@ impl Termios {
     }
 
     pub fn set_local_echo(&mut self, local_echo: bool) {
+        let flags = LocalFlags::ECHO
+            | LocalFlags::ECHOE
+            | LocalFlags::ECHOK
+            | LocalFlags::ECHOCTL
+            | LocalFlags::ECHOKE;
+
         if local_echo {
-            self.inner.local_flags |= LocalFlags::ECHO
-                | LocalFlags::ECHOE
-                | LocalFlags::ECHOK
-                | LocalFlags::ECHOCTL
-                | LocalFlags::ECHOKE;
+            self.inner.local_flags |= flags;
         } else {
-            self.inner.local_flags -= LocalFlags::ECHO
-                | LocalFlags::ECHOE
-                | LocalFlags::ECHOK
-                | LocalFlags::ECHOCTL
-                | LocalFlags::ECHOKE;
+            self.inner.local_flags -= flags;
         }
     }
 

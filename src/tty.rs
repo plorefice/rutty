@@ -10,7 +10,7 @@ use nix::{sys::termios::SpecialCharacterIndices, unistd};
 use pin_project::{pin_project, pinned_drop};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::termios::Termios;
+use crate::{cli::ESCAPE_BYTE, termios::Termios};
 
 #[pin_project(PinnedDrop)]
 pub struct Terminal<I, O>
@@ -56,6 +56,10 @@ where
         // Put terminal in raw mode and block until a single character is detected
         termios.make_raw();
         termios.as_mut().control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
+
+        // By using our escape byte as additional EOL character, we can break out of input
+        // mode even when in canonical mode
+        termios.as_mut().control_chars[SpecialCharacterIndices::VEOL2 as usize] = ESCAPE_BYTE;
 
         termios.apply(fd)
     }
