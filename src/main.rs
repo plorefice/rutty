@@ -32,8 +32,29 @@ struct Opts {
     parameters: String,
 
     /// Enable local echo, printing all characters typed back on the terminal.
+    ///
+    /// By default, local echo is disabled and any character typed in the terminal is printed
+    /// back only if the remote host is configured to do so. Some remote hosts however do not
+    /// provide this functionality, in which cases local echo provides a visual feedback of each
+    /// character typed.
+    ///
+    /// If canonical mode is also enabled, special control characters such as ERASE and NL will
+    /// behave as expected. If not, only the corresponding representation will be echoed back,
+    /// without any effect on the previously echoed characters.
     #[structopt(short = "E", long = "echo")]
     local_echo: bool,
+
+    /// Enable canonical input mode, processing input line by line.
+    ///
+    /// By default, when opening a remote connection each character typed in the terminal is
+    /// immediately sent to the remote host.
+    ///
+    /// If canonical mode is enabled, nothing will be sent until a whole line has been input and
+    /// the return character has been pressed. This allows for local line editing before sending.
+    ///
+    /// This option is mostly used in conjunction with the local echo option.
+    #[structopt(short = "C", long = "canonical")]
+    canonical: bool,
 }
 
 #[tokio::main]
@@ -57,9 +78,8 @@ async fn main() -> Result<()> {
     terminal.make_raw()?;
 
     // Process options
-    if opts.local_echo {
-        terminal.set_local_echo(true)?;
-    }
+    terminal.set_local_echo(opts.local_echo)?;
+    terminal.set_canonical_mode(opts.canonical)?;
 
     'repl: loop {
         let mut bufin = [0; 256];

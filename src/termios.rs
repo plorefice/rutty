@@ -2,7 +2,7 @@ use std::{io, os::unix::prelude::AsRawFd};
 
 use nix::sys::{
     self,
-    termios::{BaudRate, ControlFlags, FlushArg, InputFlags, LocalFlags, SetArg},
+    termios::{BaudRate, ControlFlags, FlushArg, InputFlags, LocalFlags, OutputFlags, SetArg},
 };
 
 use crate::serial::{DataBits, FlowControl, Parity, StopBits};
@@ -135,9 +135,29 @@ impl Termios {
 
     pub fn set_local_echo(&mut self, local_echo: bool) {
         if local_echo {
-            self.inner.local_flags |= LocalFlags::ECHO;
+            self.inner.local_flags |= LocalFlags::ECHO
+                | LocalFlags::ECHOE
+                | LocalFlags::ECHOK
+                | LocalFlags::ECHOCTL
+                | LocalFlags::ECHOKE;
         } else {
-            self.inner.local_flags -= LocalFlags::ECHO;
+            self.inner.local_flags -= LocalFlags::ECHO
+                | LocalFlags::ECHOE
+                | LocalFlags::ECHOK
+                | LocalFlags::ECHOCTL
+                | LocalFlags::ECHOKE;
+        }
+    }
+
+    pub fn set_canonical_mode(&mut self, canon: bool) {
+        if canon {
+            self.inner.input_flags |= InputFlags::ICRNL;
+            self.inner.local_flags |= LocalFlags::ICANON | LocalFlags::IEXTEN;
+            self.inner.output_flags |= OutputFlags::OPOST;
+        } else {
+            self.inner.input_flags -= InputFlags::ICRNL;
+            self.inner.local_flags -= LocalFlags::ICANON | LocalFlags::IEXTEN;
+            self.inner.output_flags -= OutputFlags::OPOST;
         }
     }
 }

@@ -74,6 +74,13 @@ where
         termios.set_local_echo(on);
         termios.apply(fd)
     }
+
+    pub fn set_canonical_mode(&mut self, on: bool) -> io::Result<()> {
+        let fd = self.input.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        termios.set_canonical_mode(on);
+        termios.apply(fd)
+    }
 }
 
 #[pinned_drop]
