@@ -1,16 +1,19 @@
 use std::{
-    io,
+    io::{self, Read, Write},
     pin::Pin,
     task::{Context, Poll},
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
 
-pub struct Session(ssh2::Session);
+pub struct Session {
+    session: ssh2::Session,
+    channel: Option<ssh2::Channel>,
+}
 
 impl Session {
     pub async fn new(addr: &str) -> Result<Self> {
@@ -26,42 +29,97 @@ impl Session {
         session.set_tcp_stream(tcp);
         session.handshake()?;
 
-        Ok(Self(session))
+        Ok(Self {
+            session,
+            channel: None,
+        })
     }
 
-    pub async fn authenticate_with_agent(&self, username: &str) -> Result<()> {
-        Ok(self.0.userauth_agent(username)?)
+    pub async fn authenticate_with_agent(&mut self, username: &str) -> Result<()> {
+        if self.channel.is_some() {
+            bail!("already authenticated");
+        }
+
+        self.session.userauth_agent(username)?;
+        self.channel = Some(self.open_channel()?);
+
+        Ok(())
     }
 
-    pub async fn authenticate_with_password(&self, username: &str, password: &str) -> Result<()> {
-        Ok(self.0.userauth_password(username, password)?)
+    pub async fn authenticate_with_password(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        if self.channel.is_some() {
+            bail!("already authenticated");
+        }
+
+        self.session.userauth_password(username, password)?;
+        self.channel = Some(self.open_channel()?);
+
+        Ok(())
+    }
+
+    fn open_channel(&mut self) -> Result<ssh2::Channel> {
+        // Create a channel and open a shell
+        let mut channel = self.session.channel_session()?;
+        channel.request_pty("xterm", None, None)?;
+        channel.shell()?;
+
+        // Session must be non-blocking to be made async
+        self.session.set_blocking(false);
+
+        Ok(channel)
     }
 }
 
 impl AsyncRead for Session {
     fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        todo!()
+        let channel = self.channel.as_mut().unwrap();
+
+        match channel.read(buf.initialize_unfilled()) {
+            Ok(n) => {
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 }
 
 impl AsyncWrite for Session {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        todo!()
+        let channel = self.channel.as_mut().unwrap();
+
+        match channel.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        todo!()
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let channel = self.channel.as_mut().unwrap();
+        Poll::Ready(channel.flush())
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        todo!()
+        Poll::Ready(Ok(()))
     }
 }

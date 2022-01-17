@@ -1,7 +1,6 @@
 use std::io::Write;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::TryFutureExt;
 use nix::unistd::{Uid, User};
 use structopt::StructOpt;
 use tokio::{
@@ -80,27 +79,28 @@ async fn main() -> Result<()> {
                 },
             };
 
-            let session = Session::new(&address)
+            let mut session = Session::new(&address)
                 .await
                 .with_context(|| format!("Could not connect to {}", &address))?;
 
             // Authenticate with the server.
             // Try using the agent first, and fallback on password authentication.
-            session
-                .authenticate_with_agent(&username)
-                .or_else(|_| async {
-                    let mut password = terminal.input_password(Some("Password: ")).await?;
+            if session.authenticate_with_agent(&username).await.is_err() {
+                let mut password = terminal.input_password(Some("Password: ")).await?;
 
-                    let res = session
-                        .authenticate_with_password(&username, &password)
-                        .await;
+                let res = session
+                    .authenticate_with_password(&username, &password)
+                    .await;
 
-                    // Securely clear password from memory
-                    password.zeroize();
+                // Securely clear password from memory
+                password.zeroize();
 
-                    res
-                })
-                .await?;
+                res?;
+            }
+
+            // Use a raw TTY with no local echo over serial port by default
+            opts.canonical.prefer(TristateOpt::Off);
+            opts.local_echo.prefer(TristateOpt::Off);
 
             Box::new(session)
         }
@@ -134,8 +134,15 @@ async fn main() -> Result<()> {
                 remote.write_all(&bufin[..n]).await?;
             }
             n = remote.read(&mut bufout) => {
-                terminal.write_all(&bufout[..n?])?;
+                let n = n?;
+
+                terminal.write_all(&bufout[..n])?;
                 terminal.flush()?;
+
+                // A zero byte read means EOF
+                if n == 0 {
+                    break 'repl;
+                }
             }
         }
     }
