@@ -1,21 +1,26 @@
 use std::io::Write;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use futures::TryFutureExt;
+use nix::unistd::{Uid, User};
 use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     select,
 };
+use zeroize::Zeroize;
 
 use crate::{
     cli::{Connection, EscapeDetector, Opts, TristateOpt},
     serial::SerialPort,
+    ssh::Session,
     tty::Terminal,
 };
 
 pub mod cli;
 pub mod serial;
+pub mod ssh;
 pub mod termios;
 pub mod tty;
 
@@ -24,6 +29,7 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
 
 impl AsyncReadWrite for SerialPort {}
 impl AsyncReadWrite for TcpStream {}
+impl AsyncReadWrite for Session {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,6 +70,39 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Could not connect to {}", &address))?;
 
             Box::new(stream)
+        }
+        Connection::Ssh { destination } => {
+            let (username, address) = match destination.split_once('@') {
+                Some((username, address)) => (username.to_string(), address.to_string()),
+                None => match User::from_uid(Uid::effective())? {
+                    Some(user) => (user.name, destination),
+                    None => bail!("Could not retrieve username"),
+                },
+            };
+
+            let session = Session::new(&address)
+                .await
+                .with_context(|| format!("Could not connect to {}", &address))?;
+
+            // Authenticate with the server.
+            // Try using the agent first, and fallback on password authentication.
+            session
+                .authenticate_with_agent(&username)
+                .or_else(|_| async {
+                    let mut password = terminal.input_password(Some("Password: ")).await?;
+
+                    let res = session
+                        .authenticate_with_password(&username, &password)
+                        .await;
+
+                    // Securely clear password from memory
+                    password.zeroize();
+
+                    res
+                })
+                .await?;
+
+            Box::new(session)
         }
     };
 

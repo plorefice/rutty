@@ -110,6 +110,9 @@ pub enum Connection {
         /// Supported formats are <ip>:<port> and <uri>:<port>.
         address: String,
     },
+    Ssh {
+        destination: String,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
