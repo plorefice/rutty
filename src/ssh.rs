@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{bail, Result};
+use ssh2::{PtyModeOpcode, PtyModes};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -35,42 +36,57 @@ impl Session {
         })
     }
 
-    pub async fn authenticate_with_agent(&mut self, username: &str) -> Result<()> {
+    pub fn authenticate_with_agent(&mut self, username: &str) -> Result<()> {
         if self.channel.is_some() {
             bail!("already authenticated");
         }
 
         self.session.userauth_agent(username)?;
-        self.channel = Some(self.open_channel()?);
+        self.channel = Some(self.session.channel_session()?);
 
         Ok(())
     }
 
-    pub async fn authenticate_with_password(
-        &mut self,
-        username: &str,
-        password: &str,
-    ) -> Result<()> {
+    pub fn authenticate_with_password(&mut self, username: &str, password: &str) -> Result<()> {
         if self.channel.is_some() {
             bail!("already authenticated");
         }
 
         self.session.userauth_password(username, password)?;
-        self.channel = Some(self.open_channel()?);
+        self.channel = Some(self.session.channel_session()?);
 
         Ok(())
     }
 
-    fn open_channel(&mut self) -> Result<ssh2::Channel> {
-        // Create a channel and open a shell
-        let mut channel = self.session.channel_session()?;
-        channel.request_pty("xterm", None, None)?;
+    pub fn request_pty(&mut self, size: (u32, u32)) -> Result<()> {
+        let channel = match self.channel {
+            Some(ref mut channel) => channel,
+            None => bail!("authentication required"),
+        };
+
+        // Ensure that we get a feedback on the input
+        let mut mode = PtyModes::new();
+        mode.set_boolean(PtyModeOpcode::ECHO, true);
+
+        // Allocate a terminal of the right kind
+        channel.request_pty("xterm", Some(mode), Some((size.0, size.1, 0, 0)))?;
+
+        Ok(())
+    }
+
+    pub fn shell(&mut self) -> Result<()> {
+        let channel = match self.channel {
+            Some(ref mut channel) => channel,
+            None => bail!("authentication required"),
+        };
+
+        // Open a new shell
         channel.shell()?;
 
         // Session must be non-blocking to be made async
         self.session.set_blocking(false);
 
-        Ok(channel)
+        Ok(())
     }
 }
 

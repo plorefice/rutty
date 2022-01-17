@@ -1,12 +1,13 @@
 use std::{
     io::{self, Write},
+    mem::MaybeUninit,
     os::unix::prelude::AsRawFd,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use futures::ready;
-use nix::{sys::termios::SpecialCharacterIndices, unistd};
+use nix::{ioctl_read_bad, sys::termios::SpecialCharacterIndices, unistd};
 use pin_project::{pin_project, pinned_drop};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
@@ -27,7 +28,7 @@ where
 impl<I, O> Terminal<I, O>
 where
     I: AsyncRead + AsRawFd + Unpin,
-    O: Write,
+    O: Write + AsRawFd,
 {
     pub fn new(input: I, output: O) -> io::Result<Self> {
         Ok(Self {
@@ -72,6 +73,18 @@ where
         }
 
         Ok(())
+    }
+
+    pub fn get_size(&self) -> io::Result<(u32, u32)> {
+        ioctl_read_bad!(tcgwinsz, nix::libc::TIOCGWINSZ, nix::libc::winsize);
+
+        let winsize = unsafe {
+            let mut winsize = MaybeUninit::uninit();
+            tcgwinsz(self.output.as_raw_fd(), winsize.as_mut_ptr())?;
+            winsize.assume_init()
+        };
+
+        Ok((winsize.ws_col.into(), winsize.ws_row.into()))
     }
 
     pub fn set_local_echo(&mut self, on: bool) -> io::Result<()> {

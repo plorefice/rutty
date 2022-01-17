@@ -105,18 +105,20 @@ async fn run() -> Result<()> {
 
             // Authenticate with the server.
             // Try using the agent first, and fallback on password authentication.
-            if session.authenticate_with_agent(&username).await.is_err() {
+            if session.authenticate_with_agent(&username).is_err() {
                 let mut password = terminal.input_password(Some("Password: ")).await?;
-
-                let res = session
-                    .authenticate_with_password(&username, &password)
-                    .await;
+                let res = session.authenticate_with_password(&username, &password);
 
                 // Securely clear password from memory
                 password.zeroize();
 
                 res?;
             }
+
+            // After authentication, create the virtual terminal and the shell
+            let size = terminal.get_size()?;
+            session.request_pty(size)?;
+            session.shell()?;
 
             // SSH shells require a raw TTY
             opts.canonical.prefer(TristateOpt::Off);
