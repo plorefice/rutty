@@ -16,5 +16,5 @@ structopt = "0.3"
 zeroize = "1.5"
 
 [dependencies.tokio]
-features = ["rt-multi-thread", "io-std", "io-util", "net", "macros"]
+features = ["rt", "rt-multi-thread", "io-std", "io-util", "net", "macros"]
 version = "1.15"

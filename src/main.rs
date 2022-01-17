@@ -6,6 +6,7 @@ use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    runtime::Runtime,
     select,
 };
 use zeroize::Zeroize;
@@ -30,8 +31,27 @@ impl AsyncReadWrite for SerialPort {}
 impl AsyncReadWrite for TcpStream {}
 impl AsyncReadWrite for Session {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = Runtime::new()?;
+
+    runtime.block_on(async { run().await })?;
+
+    // Normally, this wouldn't be necessary. The problem here is that tokio::io::Stdin spawns
+    // a new thread with a blocking read operation inside each time a read operation is issued,
+    // causing the runtime thread to hang until the user presses enter (or EOF is reached).
+    //
+    // When using it to run an interactive shell however, an early termination of the shell, due
+    // for example to the remote host closing the connection on its end, causes the program to hang
+    // until the next enter keypress, which is kinda ugly, UX-wise.
+    //
+    // To avoid this, we drop the runtime in background, which immediately kills all pending tasks.
+    // It shouldn't be an issue since all the other objects have already been dropped.
+    runtime.shutdown_background();
+
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let mut opts = Opts::from_args();
 
     let mut terminal = Terminal::new(tokio::io::stdin(), std::io::stdout())?;
@@ -98,7 +118,7 @@ async fn main() -> Result<()> {
                 res?;
             }
 
-            // Use a raw TTY with no local echo over serial port by default
+            // SSH shells require a raw TTY
             opts.canonical.prefer(TristateOpt::Off);
             opts.local_echo.prefer(TristateOpt::Off);
 
