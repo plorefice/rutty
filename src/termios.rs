@@ -1,3 +1,5 @@
+//! Types for working with raw file descriptor options.
+
 use std::{io, os::unix::prelude::AsRawFd};
 
 use nix::sys::{
@@ -7,18 +9,21 @@ use nix::sys::{
 
 use crate::serial::{DataBits, FlowControl, Parity, StopBits};
 
+/// Interface that is provided to control file descriptor options.
 #[derive(Debug, Clone)]
 pub struct Termios {
     inner: sys::termios::Termios,
 }
 
 impl Termios {
+    /// Retrieves the parameters associated with a file descriptor.
     pub fn from_raw_fd<F: AsRawFd>(fd: F) -> io::Result<Self> {
         Ok(Self {
             inner: sys::termios::tcgetattr(fd.as_raw_fd())?,
         })
     }
 
+    /// Immediately applies the options in `self` a file descriptor.
     pub fn apply<F: AsRawFd>(&self, fd: F) -> io::Result<()> {
         let fd = fd.as_raw_fd();
 
@@ -28,10 +33,12 @@ impl Termios {
         Ok(())
     }
 
+    /// Configures `self` in raw mode.
     pub fn make_raw(&mut self) {
         sys::termios::cfmakeraw(&mut self.inner);
     }
 
+    /// Modifies the baud rate contained in `self`.
     pub fn set_baud_rate(&mut self, baud_rate: u32) -> io::Result<()> {
         let baud_rate = match baud_rate {
             0 => BaudRate::B0,
@@ -79,6 +86,7 @@ impl Termios {
         Ok(())
     }
 
+    /// Modifies the data bits option contained in `self`.
     pub fn set_data_bits(&mut self, data_bits: DataBits) {
         self.inner.control_flags -= ControlFlags::CSIZE;
         self.inner.control_flags |= match data_bits {
@@ -89,6 +97,7 @@ impl Termios {
         };
     }
 
+    /// Modifies the parity option contained in `self`.
     pub fn set_parity(&mut self, parity: Parity) {
         match parity {
             Parity::None => {
@@ -109,6 +118,7 @@ impl Termios {
         }
     }
 
+    /// Modifies the data bits option contained in `self`.
     pub fn set_stop_bits(&mut self, stop_bits: StopBits) {
         match stop_bits {
             StopBits::One => self.inner.control_flags &= !ControlFlags::CSTOPB,
@@ -116,6 +126,7 @@ impl Termios {
         }
     }
 
+    /// Modifies the flow control option contained in `self`.
     pub fn set_flow_control(&mut self, flow_control: FlowControl) {
         match flow_control {
             FlowControl::None => {
@@ -133,6 +144,7 @@ impl Termios {
         }
     }
 
+    /// Modifies the echo flags contained in `self`.
     pub fn set_local_echo(&mut self, local_echo: bool) {
         let flags = LocalFlags::ECHO
             | LocalFlags::ECHOE
@@ -147,6 +159,7 @@ impl Termios {
         }
     }
 
+    /// Modifies the canonical mode flags contained in `self`.
     pub fn set_canonical_mode(&mut self, canon: bool) {
         if canon {
             self.inner.input_flags |= InputFlags::ICRNL;

@@ -1,3 +1,5 @@
+//! Types for working with an interactive terminal.
+
 use std::{
     io::{self, Write},
     mem::MaybeUninit,
@@ -11,10 +13,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 use crate::{cli::ESCAPE_BYTE, termios::Termios};
 
-pub struct Terminal<I: AsRawFd, O> {
+/// Abstraction over the PTY to which the stdin and stdout of the current process are connected.
+pub struct Terminal<I: AsRawFd, O: AsRawFd> {
     input: I,
     output: O,
-    saved_state: Option<Termios>,
+    saved_state: Termios,
 }
 
 impl<I, O> Terminal<I, O>
@@ -22,31 +25,34 @@ where
     I: AsRawFd,
     O: AsRawFd,
 {
+    /// Wraps the specified input and output streams in a `Terminal`.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if `input` is not a PTY.
     pub fn new(input: I, output: O) -> io::Result<Self> {
-        Ok(Self {
-            input,
-            output,
-            saved_state: None,
-        })
-    }
+        let fd = input.as_raw_fd();
 
-    pub fn make_raw(&mut self) -> io::Result<()> {
-        let fd = self.input.as_raw_fd();
-
-        // Do nothing if the terminal is already in raw mode
-        if self.saved_state.is_some() {
-            return Ok(());
-        }
-
-        // The input must be a tty in order to be put in raw mode
+        // For the time being, do not try working with anything other than PTYs.
         if !unistd::isatty(fd)? {
             return Err(io::Error::new(io::ErrorKind::Other, "not a TTY"));
         }
 
-        let mut termios = Termios::from_raw_fd(fd)?;
-
         // Push the current state in order to restore it on drop
-        self.saved_state = Some(termios.clone());
+        let saved_state = Termios::from_raw_fd(fd)?;
+
+        Ok(Self {
+            input,
+            output,
+            saved_state,
+        })
+    }
+
+    /// Puts the terminal in raw mode.
+    pub fn make_raw(&mut self) -> io::Result<()> {
+        let fd = self.input.as_raw_fd();
+
+        let mut termios = Termios::from_raw_fd(fd)?;
 
         // Put terminal in raw mode and block until a single character is detected
         termios.make_raw();
@@ -59,14 +65,12 @@ where
         termios.apply(fd)
     }
 
+    /// Restores the terminal state as it was when `self` was first created.
     pub fn restore(&mut self) -> io::Result<()> {
-        if let Some(termios) = self.saved_state.take() {
-            termios.apply(self.input.as_raw_fd())?;
-        }
-
-        Ok(())
+        self.saved_state.apply(self.input.as_raw_fd())
     }
 
+    /// Retrieves the current terminal size.
     pub fn get_size(&self) -> io::Result<(u32, u32)> {
         ioctl_read_bad!(tcgwinsz, nix::libc::TIOCGWINSZ, nix::libc::winsize);
 
@@ -79,6 +83,7 @@ where
         Ok((winsize.ws_col.into(), winsize.ws_row.into()))
     }
 
+    /// Enables or disables the terminal echo.
     pub fn set_local_echo(&mut self, on: bool) -> io::Result<()> {
         let fd = self.input.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -86,6 +91,7 @@ where
         termios.apply(fd)
     }
 
+    /// Puts the terminal in canonical mode or raw mode.
     pub fn set_canonical_mode(&mut self, on: bool) -> io::Result<()> {
         let fd = self.input.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -104,6 +110,7 @@ where
     I: AsyncRead + AsRawFd + Unpin,
     O: AsRawFd + Unpin,
 {
+    /// Reads a string from the terminal's input without echo.
     pub async fn input_password(&mut self) -> io::Result<String> {
         let fd = self.input.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -131,12 +138,10 @@ where
     }
 }
 
-impl<I: AsRawFd, O> Drop for Terminal<I, O> {
+impl<I: AsRawFd, O: AsRawFd> Drop for Terminal<I, O> {
     fn drop(&mut self) {
-        // Restore the previous terminal state in case the terminal was put in raw mode
-        if let Some(termios) = self.saved_state.take() {
-            termios.apply(self.input.as_raw_fd()).ok();
-        }
+        // Restore the origina terminal state
+        let _ = self.restore();
     }
 }
 
@@ -154,7 +159,11 @@ where
     }
 }
 
-impl<I: AsRawFd, O: Write> Write for Terminal<I, O> {
+impl<I, O> Write for Terminal<I, O>
+where
+    I: AsRawFd,
+    O: Write + AsRawFd,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.output.write(buf)
     }

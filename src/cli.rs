@@ -1,12 +1,15 @@
+//! The tool's command line interface description.
+
 use std::{path::PathBuf, str::FromStr};
 
 use structopt::StructOpt;
 
 use crate::serial::{DataBits, Parity, StopBits};
 
-// If this byte is detected as input, the program will quit.
+/// If this byte is detected as input, the program will quit.
 pub const ESCAPE_BYTE: u8 = 0x1d;
 
+/// A structure built from command-line options.
 #[derive(Debug, StructOpt)]
 #[structopt(name = env!("CARGO_PKG_NAME"), about = env!("CARGO_PKG_DESCRIPTION"))]
 pub struct Opts {
@@ -51,8 +54,11 @@ pub struct Opts {
 /// The default state is selected at compile time using a const-generic bool parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StructOpt)]
 pub enum TristateOpt<const DEFAULT: bool> {
+    /// Option is enabled
     On,
+    /// Option is disabled
     Off,
+    /// Let the tool decide the best configuration
     Auto,
 }
 
@@ -80,6 +86,7 @@ impl<const DEFAULT: bool> From<TristateOpt<DEFAULT>> for bool {
 }
 
 impl<const DEFAULT: bool> TristateOpt<DEFAULT> {
+    /// Changes the option value to the specified state only if `auto` is currently selected.
     pub fn prefer(&mut self, state: TristateOpt<DEFAULT>) {
         if *self == Self::Auto {
             *self = state;
@@ -87,6 +94,7 @@ impl<const DEFAULT: bool> TristateOpt<DEFAULT> {
     }
 }
 
+/// Protocol to use to connect to the remote host.
 #[derive(Debug, StructOpt)]
 pub enum Connection {
     /// Open a serial connection on the specified device file.
@@ -110,15 +118,23 @@ pub enum Connection {
         /// Supported formats are <ip>:<port> and <uri>:<port>.
         address: String,
     },
+    /// Open a SSH session towards the specified destination.
     Ssh {
+        /// Destination of the remote host.
+        ///
+        /// The recognized format is [user@]host[:port].
+        /// The host can be either an IP address or a hostname.
         destination: String,
     },
 }
 
+/// Utility to recognize if the escape byte has been entered the specified number of times.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EscapeDetector(u32);
 
 impl EscapeDetector {
+    /// Feeds a new byte to the detector and returns true if the specified number of consecutive
+    /// escape bytes have been detected.
     pub fn feed(&mut self, byte: u8) -> bool {
         if byte == ESCAPE_BYTE {
             self.0 += 1;
@@ -129,6 +145,8 @@ impl EscapeDetector {
     }
 }
 
+/// Parses a serial parameter string comprised of data bits, parity and stop bits in canonical
+/// form (eg. `8N1').
 pub fn parse_serial_parameters(s: &str) -> Option<(DataBits, Parity, StopBits)> {
     let mut chars = s.chars();
 

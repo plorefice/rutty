@@ -1,3 +1,8 @@
+//! Rutty is a terminal emulator and serial console that aims to supports the most common network
+//! and file transfer protocols in a single command-line tool.
+
+#![warn(missing_docs)]
+
 use std::io::Write;
 
 use anyhow::{anyhow, bail, Context, Result};

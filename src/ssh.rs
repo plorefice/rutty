@@ -1,3 +1,5 @@
+//! SSH connection and session handling.
+
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
@@ -12,6 +14,7 @@ use futures::ready;
 use ssh2::{PtyModeOpcode, PtyModes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// A reference to an established SSH session with a remote host.
 pub struct Session {
     session: ssh2::Session,
     channel: Option<ssh2::Channel>,
@@ -19,6 +22,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// Attempts to establish an SSH session with the host at `addr`.
     pub async fn new(addr: &str) -> Result<Self> {
         let addr = match addr.split_once(':') {
             Some((addr, port)) => (addr.to_string(), port.parse::<u16>()?),
@@ -39,6 +43,7 @@ impl Session {
         })
     }
 
+    /// Performs an SSH agent authentication with the remote host as `username`.
     pub fn authenticate_with_agent(&mut self, username: &str) -> Result<()> {
         if self.channel.is_some() {
             bail!("already authenticated");
@@ -50,6 +55,7 @@ impl Session {
         Ok(())
     }
 
+    /// Performs a password authentication with the remote host as `username`.
     pub fn authenticate_with_password(&mut self, username: &str, password: &str) -> Result<()> {
         if self.channel.is_some() {
             bail!("already authenticated");
@@ -61,6 +67,11 @@ impl Session {
         Ok(())
     }
 
+    /// Requests a PTY on an established channel.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if it is called before authenticating with the remote.
     pub fn request_pty(&mut self, size: (u32, u32)) -> Result<()> {
         let channel = match self.channel {
             Some(ref mut channel) => channel,
@@ -77,6 +88,11 @@ impl Session {
         Ok(())
     }
 
+    /// Start a shell on the remote host.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if it is called before authenticating with the remote.
     pub fn shell(&mut self) -> Result<()> {
         let channel = match self.channel {
             Some(ref mut channel) => channel,

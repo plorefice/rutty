@@ -1,3 +1,5 @@
+//! Types for working with serial devices.
+
 use std::{
     io::{self, Read, Write},
     os::unix::prelude::{AsRawFd, RawFd},
@@ -17,15 +19,19 @@ use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::termios::Termios;
 
+/// A reference to an open serial port device.
 pub struct SerialPort {
     inner: AsyncFd<TtyDevice>,
 }
 
 impl SerialPort {
+    /// Opens the serial port corresponding to the specified device node with default options.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::with_options().open(path)
     }
 
+    /// Returns a new `SerialPortOptions` object that can be used to open a serial port with
+    /// configurable communication parameters.
     pub fn with_options() -> SerialPortOptions {
         SerialPortOptions::default()
     }
@@ -33,7 +39,7 @@ impl SerialPort {
     fn open_with_options<P: AsRef<Path>>(path: P, opts: SerialPortOptions) -> io::Result<Self> {
         let tty = TtyDevice::open(path)?;
 
-        //Make the file descriptor non-blocking
+        // Make the file descriptor non-blocking
         // SAFETY: the bitfield retrieved with F_GETFL is assumed to be always valid.
         let fd = tty.as_raw_fd();
         let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
@@ -53,6 +59,7 @@ impl SerialPort {
         Ok(port)
     }
 
+    /// Configures the baud rate used for communication on this serial port.
     pub fn set_baud_rate(&mut self, baud_rate: u32) -> io::Result<()> {
         let fd = self.inner.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -60,6 +67,7 @@ impl SerialPort {
         termios.apply(fd)
     }
 
+    /// Configures the number of data bits used for communication on this serial port.
     pub fn set_data_bits(&mut self, data_bits: DataBits) -> io::Result<()> {
         let fd = self.inner.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -67,6 +75,7 @@ impl SerialPort {
         termios.apply(fd)
     }
 
+    /// Configures the number of stop bits used for communication on this serial port.
     pub fn set_stop_bits(&mut self, stop_bits: StopBits) -> io::Result<()> {
         let fd = self.inner.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -74,6 +83,7 @@ impl SerialPort {
         termios.apply(fd)
     }
 
+    /// Configures the parity check used for communication on this serial port.
     pub fn set_parity(&mut self, parity: Parity) -> io::Result<()> {
         let fd = self.inner.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -81,6 +91,7 @@ impl SerialPort {
         termios.apply(fd)
     }
 
+    /// Configures the flow control used for communication on this serial port.
     pub fn set_flow_control(&mut self, flow_control: FlowControl) -> io::Result<()> {
         let fd = self.inner.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -138,6 +149,9 @@ impl AsyncWrite for SerialPort {
     }
 }
 
+/// Options which can be used to configure how a serial port is opened.
+///
+/// The default options are 115200bps 8N1 with no flow control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SerialPortOptions {
     baud_rate: u32,
@@ -158,35 +172,43 @@ impl Default for SerialPortOptions {
 }
 
 impl SerialPortOptions {
+    /// Creates a blank set of options with their default value.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the baud rate to be used for communication.
     pub fn baud_rate(&mut self, baud_rate: u32) -> &mut Self {
         self.baud_rate = baud_rate;
         self
     }
 
+    /// Sets the number of data bits to be used for communication.
     pub fn data_bits(&mut self, data_bits: DataBits) -> &mut Self {
         self.data_bits = data_bits;
         self
     }
 
+    /// Sets the number of stop bits to be used for communication.
     pub fn stop_bits(&mut self, stop_bits: StopBits) -> &mut Self {
         self.stop_bits = stop_bits;
         self
     }
 
+    /// Sets the parity check to be performed for communication.
     pub fn parity(&mut self, parity: Parity) -> &mut Self {
         self.parity = parity;
         self
     }
 
+    /// Opens a serial port device with the options specified by `self`.
     pub fn open<P: AsRef<Path>>(self, path: P) -> io::Result<SerialPort> {
         SerialPort::open_with_options(path, self)
     }
 }
 
+/// Number of data bits in a byte.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataBits {
     Five,
@@ -195,12 +217,16 @@ pub enum DataBits {
     Eight,
 }
 
+/// Number of stop bits after a byte.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopBits {
     One,
     Two,
 }
 
+/// Parity check to be performed on the byte.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parity {
     None,
@@ -208,6 +234,8 @@ pub enum Parity {
     Odd,
 }
 
+/// Flow control, either hardware, software or none.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowControl {
     None,
