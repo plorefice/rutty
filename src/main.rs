@@ -57,11 +57,11 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let mut opts = Opts::from_args();
+    let mut cli = Opts::from_args();
 
     let mut terminal = Terminal::new(tokio::io::stdin(), std::io::stdout())?;
 
-    let mut remote: Box<dyn AsyncReadWrite> = match opts.connection {
+    let mut remote: Box<dyn AsyncReadWrite> = match cli.connection {
         Connection::Serial {
             device,
             baud_rate,
@@ -81,8 +81,8 @@ async fn run() -> Result<()> {
                 .with_context(|| format!("Could not open {}", &device.display()))?;
 
             // Use a raw TTY with no local echo over serial port by default
-            opts.canonical.prefer(TristateOpt::Off);
-            opts.local_echo.prefer(TristateOpt::Off);
+            cli.canonical.prefer(TristateOpt::Off);
+            cli.local_echo.prefer(TristateOpt::Off);
 
             Box::new(port)
         }
@@ -95,7 +95,11 @@ async fn run() -> Result<()> {
 
             Box::new(stream)
         }
-        Connection::Ssh { destination } => {
+        Connection::Ssh {
+            destination,
+            opts,
+            command,
+        } => {
             let (username, address) = match destination.split_once('@') {
                 Some((username, address)) => (username.to_string(), address.to_string()),
                 None => match User::from_uid(Uid::effective())? {
@@ -104,7 +108,7 @@ async fn run() -> Result<()> {
                 },
             };
 
-            let mut session = Session::new(&address)
+            let mut session = Session::new((address.as_str(), opts.port))
                 .await
                 .with_context(|| format!("Could not connect to {}", &address))?;
 
@@ -125,28 +129,32 @@ async fn run() -> Result<()> {
                 res?;
             }
 
-            // After authentication, create the virtual terminal and the shell
-            let size = terminal.get_size()?;
-            session.request_pty(size)?;
-            session.shell()?;
+            if let Some((command, args)) = command.split_first() {
+                // Run the command and print the output.
+                // Don't bother exiting early here, the SSH channel will receive a EOF anyway.
+                let output = session.run(command, args).await?;
+                write!(terminal, "{}", output)?;
+            } else {
+                // After authentication, create the virtual terminal and the shell
+                let size = terminal.get_size()?;
+                session.request_pty(size)?;
+                session.shell()?;
+            }
 
             // SSH shells require a raw TTY
-            opts.canonical.prefer(TristateOpt::Off);
-            opts.local_echo.prefer(TristateOpt::Off);
+            cli.canonical.prefer(TristateOpt::Off);
+            cli.local_echo.prefer(TristateOpt::Off);
 
             Box::new(session)
         }
     };
 
-    // Usage instructions
-    writeln!(terminal, "Connected, press ^] to quit.\n")?;
-
     // Start with a raw mode TTY and start build up from that
     terminal.make_raw()?;
 
     // Process TTY options
-    terminal.set_local_echo(opts.local_echo.into())?;
-    terminal.set_canonical_mode(opts.canonical.into())?;
+    terminal.set_local_echo(cli.local_echo.into())?;
+    terminal.set_canonical_mode(cli.canonical.into())?;
 
     let mut exiter = EscapeDetector::default();
 

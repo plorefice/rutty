@@ -2,7 +2,7 @@
 
 use std::{
     io::{self, Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     os::unix::prelude::AsRawFd,
     pin::Pin,
     task::{Context, Poll},
@@ -12,7 +12,7 @@ use anyhow::{bail, Result};
 use async_io::Async;
 use futures::ready;
 use ssh2::{PtyModeOpcode, PtyModes};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 /// A reference to an established SSH session with a remote host.
 pub struct Session {
@@ -23,12 +23,7 @@ pub struct Session {
 
 impl Session {
     /// Attempts to establish an SSH session with the host at `addr`.
-    pub async fn new(addr: &str) -> Result<Self> {
-        let addr = match addr.split_once(':') {
-            Some((addr, port)) => (addr.to_string(), port.parse::<u16>()?),
-            None => (addr.to_string(), 22),
-        };
-
+    pub async fn new<A: ToSocketAddrs>(addr: A) -> Result<Self> {
         // Connect to the remote SSH server
         let tcp = TcpStream::connect(addr)?;
         let mut session = ssh2::Session::new()?;
@@ -106,6 +101,32 @@ impl Session {
         self.session.set_blocking(false);
 
         Ok(())
+    }
+
+    /// Run a command on the remote host.
+    pub async fn run<A>(&mut self, command: &str, args: A) -> Result<String>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<str>,
+    {
+        let channel = match self.channel {
+            Some(ref mut channel) => channel,
+            None => bail!("authentication required"),
+        };
+
+        let mut command = command.to_string();
+
+        // Append arguments surrounded in quotes to prevent word splitting
+        for arg in args {
+            command.push_str(&format!(" \"{}\"", arg.as_ref()));
+        }
+
+        channel.exec(&command)?;
+
+        let mut response = String::new();
+        self.read_to_string(&mut response).await?;
+
+        Ok(response)
     }
 }
 

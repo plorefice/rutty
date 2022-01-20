@@ -118,14 +118,30 @@ pub enum Connection {
         /// Supported formats are <ip>:<port> and <uri>:<port>.
         address: String,
     },
-    /// Open a SSH session towards the specified destination.
+    /// Open a shell or run a command over SSH on a remote host.
     Ssh {
         /// Destination of the remote host.
         ///
-        /// The recognized format is [user@]host[:port].
+        /// The recognized format is [user@]host.
         /// The host can be either an IP address or a hostname.
         destination: String,
+
+        /// Command to run on the remote host, including arguments.
+        command: Vec<String>,
+
+        /// SSH connection options.
+        #[structopt(flatten)]
+        opts: SshOptions,
     },
+}
+
+// TODO: putting a doc comment here conflicts with StructOpt documentation.
+#[allow(missing_docs)]
+#[derive(Debug, StructOpt)]
+pub struct SshOptions {
+    /// Remote port to connect to.
+    #[structopt(short, long, default_value = "22")]
+    pub port: u16,
 }
 
 /// Utility to recognize if the escape byte has been entered the specified number of times.
