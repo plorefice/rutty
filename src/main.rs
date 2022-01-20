@@ -106,12 +106,17 @@ async fn run() -> Result<()> {
             // Authenticate with the server.
             // Try using the agent first, and fallback on password authentication.
             if session.authenticate_with_agent(&username).is_err() {
-                let mut password = terminal.input_password(Some("Password: ")).await?;
+                // Show a prompt to the user
+                write!(terminal, "Password: ")?;
+                terminal.flush()?;
+
+                let mut password = terminal.input_password().await?;
                 let res = session.authenticate_with_password(&username, &password);
 
                 // Securely clear password from memory
                 password.zeroize();
 
+                writeln!(terminal)?;
                 res?;
             }
 

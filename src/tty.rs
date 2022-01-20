@@ -6,20 +6,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::ready;
 use nix::{ioctl_read_bad, sys::termios::SpecialCharacterIndices, unistd};
-use pin_project::{pin_project, pinned_drop};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 use crate::{cli::ESCAPE_BYTE, termios::Termios};
 
-#[pin_project(PinnedDrop)]
-pub struct Terminal<I, O>
-where
-    I: AsyncRead + AsRawFd + Unpin,
-    O: Write,
-{
-    #[pin]
+pub struct Terminal<I: AsRawFd, O> {
     input: I,
     output: O,
     saved_state: Option<Termios>,
@@ -27,8 +19,8 @@ where
 
 impl<I, O> Terminal<I, O>
 where
-    I: AsyncRead + AsRawFd + Unpin,
-    O: Write + AsRawFd,
+    I: AsRawFd,
+    O: AsRawFd,
 {
     pub fn new(input: I, output: O) -> io::Result<Self> {
         Ok(Self {
@@ -101,7 +93,18 @@ where
         termios.apply(fd)
     }
 
-    pub async fn input_password(&mut self, prefix: Option<&str>) -> io::Result<String> {
+    fn pin_input(self: Pin<&mut Self>) -> &mut I {
+        // SAFETY: this is okay because `input` is never considered pinned.
+        unsafe { &mut self.get_unchecked_mut().input }
+    }
+}
+
+impl<I, O> Terminal<I, O>
+where
+    I: AsyncRead + AsRawFd + Unpin,
+    O: AsRawFd + Unpin,
+{
+    pub async fn input_password(&mut self) -> io::Result<String> {
         let fd = self.input.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
         let saved_state = termios.clone();
@@ -110,16 +113,9 @@ where
         termios.set_local_echo(false);
         termios.apply(fd)?;
 
-        // Print a prefix if requested
-        if let Some(prefix) = prefix {
-            self.write_all(prefix.as_bytes())?;
-            self.flush()?;
-        }
-
         // Read password from the terminal and convert it to UTF-8
         let mut password = [0; 256];
         let n = self.read(&mut password).await?;
-        writeln!(self)?;
 
         // The password read from the terminal will contain a trailing newline, so remove it
         let password = std::str::from_utf8(&password[..n])
@@ -135,18 +131,11 @@ where
     }
 }
 
-#[pinned_drop]
-impl<I, O> PinnedDrop for Terminal<I, O>
-where
-    I: AsyncRead + AsRawFd + Unpin,
-    O: Write,
-{
-    fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
-
+impl<I: AsRawFd, O> Drop for Terminal<I, O> {
+    fn drop(&mut self) {
         // Restore the previous terminal state in case the terminal was put in raw mode
-        if let Some(termios) = this.saved_state {
-            termios.apply(this.input.as_raw_fd()).ok();
+        if let Some(termios) = self.saved_state.take() {
+            termios.apply(self.input.as_raw_fd()).ok();
         }
     }
 }
@@ -154,24 +143,18 @@ where
 impl<I, O> AsyncRead for Terminal<I, O>
 where
     I: AsyncRead + AsRawFd + Unpin,
-    O: Write,
+    O: AsRawFd,
 {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.as_mut().project();
-        let res = ready!(this.input.poll_read(cx, buf));
-        Poll::Ready(res)
+        Pin::new(self.pin_input()).poll_read(cx, buf)
     }
 }
 
-impl<I, O> Write for Terminal<I, O>
-where
-    I: AsyncRead + AsRawFd + Unpin,
-    O: Write,
-{
+impl<I: AsRawFd, O: Write> Write for Terminal<I, O> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.output.write(buf)
     }
