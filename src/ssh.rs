@@ -1,19 +1,21 @@
 use std::{
     io::{self, Read, Write},
+    net::TcpStream,
+    os::unix::prelude::AsRawFd,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use anyhow::{bail, Result};
+use async_io::Async;
+use futures::ready;
 use ssh2::{PtyModeOpcode, PtyModes};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub struct Session {
     session: ssh2::Session,
     channel: Option<ssh2::Channel>,
+    stream: Option<Async<TcpStream>>,
 }
 
 impl Session {
@@ -24,15 +26,16 @@ impl Session {
         };
 
         // Connect to the remote SSH server
-        let tcp = TcpStream::connect(addr).await?;
+        let tcp = TcpStream::connect(addr)?;
         let mut session = ssh2::Session::new()?;
 
-        session.set_tcp_stream(tcp);
+        session.set_tcp_stream(tcp.as_raw_fd());
         session.handshake()?;
 
         Ok(Self {
             session,
             channel: None,
+            stream: Some(Async::new(tcp)?),
         })
     }
 
@@ -96,18 +99,19 @@ impl AsyncRead for Session {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let channel = self.channel.as_mut().unwrap();
+        loop {
+            let channel = self.channel.as_mut().unwrap();
 
-        match channel.read(buf.initialize_unfilled()) {
-            Ok(n) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
+            match channel.read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.stream.as_mut().unwrap().poll_readable(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
@@ -118,15 +122,16 @@ impl AsyncWrite for Session {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        let channel = self.channel.as_mut().unwrap();
+        loop {
+            let channel = self.channel.as_mut().unwrap();
 
-        match channel.write(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+            match channel.write(buf) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.stream.as_mut().unwrap().poll_writable(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
             }
-            Err(e) => Poll::Ready(Err(e)),
         }
     }
 
