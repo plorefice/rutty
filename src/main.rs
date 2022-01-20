@@ -6,7 +6,7 @@ use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    runtime::Runtime,
+    runtime::Builder,
     select,
 };
 use zeroize::Zeroize;
@@ -32,7 +32,7 @@ impl AsyncReadWrite for TcpStream {}
 impl AsyncReadWrite for Session {}
 
 fn main() -> Result<()> {
-    let runtime = Runtime::new()?;
+    let runtime = Builder::new_current_thread().thread_name("rutty").build()?;
 
     runtime.block_on(async { run().await })?;
 
