@@ -1,21 +1,26 @@
 use std::io::Write;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use nix::unistd::{Uid, User};
 use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    runtime::Runtime,
     select,
 };
+use zeroize::Zeroize;
 
 use crate::{
     cli::{Connection, EscapeDetector, Opts, TristateOpt},
     serial::SerialPort,
+    ssh::Session,
     tty::Terminal,
 };
 
 pub mod cli;
 pub mod serial;
+pub mod ssh;
 pub mod termios;
 pub mod tty;
 
@@ -24,9 +29,29 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
 
 impl AsyncReadWrite for SerialPort {}
 impl AsyncReadWrite for TcpStream {}
+impl AsyncReadWrite for Session {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = Runtime::new()?;
+
+    runtime.block_on(async { run().await })?;
+
+    // Normally, this wouldn't be necessary. The problem here is that tokio::io::Stdin spawns
+    // a new thread with a blocking read operation inside each time a read operation is issued,
+    // causing the runtime thread to hang until the user presses enter (or EOF is reached).
+    //
+    // When using it to run an interactive shell however, an early termination of the shell, due
+    // for example to the remote host closing the connection on its end, causes the program to hang
+    // until the next enter keypress, which is kinda ugly, UX-wise.
+    //
+    // To avoid this, we drop the runtime in background, which immediately kills all pending tasks.
+    // It shouldn't be an issue since all the other objects have already been dropped.
+    runtime.shutdown_background();
+
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let mut opts = Opts::from_args();
 
     let mut terminal = Terminal::new(tokio::io::stdin(), std::io::stdout())?;
@@ -65,6 +90,42 @@ async fn main() -> Result<()> {
 
             Box::new(stream)
         }
+        Connection::Ssh { destination } => {
+            let (username, address) = match destination.split_once('@') {
+                Some((username, address)) => (username.to_string(), address.to_string()),
+                None => match User::from_uid(Uid::effective())? {
+                    Some(user) => (user.name, destination),
+                    None => bail!("Could not retrieve username"),
+                },
+            };
+
+            let mut session = Session::new(&address)
+                .await
+                .with_context(|| format!("Could not connect to {}", &address))?;
+
+            // Authenticate with the server.
+            // Try using the agent first, and fallback on password authentication.
+            if session.authenticate_with_agent(&username).is_err() {
+                let mut password = terminal.input_password(Some("Password: ")).await?;
+                let res = session.authenticate_with_password(&username, &password);
+
+                // Securely clear password from memory
+                password.zeroize();
+
+                res?;
+            }
+
+            // After authentication, create the virtual terminal and the shell
+            let size = terminal.get_size()?;
+            session.request_pty(size)?;
+            session.shell()?;
+
+            // SSH shells require a raw TTY
+            opts.canonical.prefer(TristateOpt::Off);
+            opts.local_echo.prefer(TristateOpt::Off);
+
+            Box::new(session)
+        }
     };
 
     // Usage instructions
@@ -95,8 +156,15 @@ async fn main() -> Result<()> {
                 remote.write_all(&bufin[..n]).await?;
             }
             n = remote.read(&mut bufout) => {
-                terminal.write_all(&bufout[..n?])?;
+                let n = n?;
+
+                terminal.write_all(&bufout[..n])?;
                 terminal.flush()?;
+
+                // A zero byte read means EOF
+                if n == 0 {
+                    break 'repl;
+                }
             }
         }
     }

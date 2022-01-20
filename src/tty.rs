@@ -1,21 +1,23 @@
 use std::{
     io::{self, Write},
+    mem::MaybeUninit,
     os::unix::prelude::AsRawFd,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use futures::ready;
-use nix::{sys::termios::SpecialCharacterIndices, unistd};
+use nix::{ioctl_read_bad, sys::termios::SpecialCharacterIndices, unistd};
 use pin_project::{pin_project, pinned_drop};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 use crate::{cli::ESCAPE_BYTE, termios::Termios};
 
 #[pin_project(PinnedDrop)]
 pub struct Terminal<I, O>
 where
-    I: AsyncRead + AsRawFd,
+    I: AsyncRead + AsRawFd + Unpin,
+    O: Write,
 {
     #[pin]
     input: I,
@@ -25,7 +27,8 @@ where
 
 impl<I, O> Terminal<I, O>
 where
-    I: AsyncRead + AsRawFd,
+    I: AsyncRead + AsRawFd + Unpin,
+    O: Write + AsRawFd,
 {
     pub fn new(input: I, output: O) -> io::Result<Self> {
         Ok(Self {
@@ -72,6 +75,18 @@ where
         Ok(())
     }
 
+    pub fn get_size(&self) -> io::Result<(u32, u32)> {
+        ioctl_read_bad!(tcgwinsz, nix::libc::TIOCGWINSZ, nix::libc::winsize);
+
+        let winsize = unsafe {
+            let mut winsize = MaybeUninit::uninit();
+            tcgwinsz(self.output.as_raw_fd(), winsize.as_mut_ptr())?;
+            winsize.assume_init()
+        };
+
+        Ok((winsize.ws_col.into(), winsize.ws_row.into()))
+    }
+
     pub fn set_local_echo(&mut self, on: bool) -> io::Result<()> {
         let fd = self.input.as_raw_fd();
         let mut termios = Termios::from_raw_fd(fd)?;
@@ -85,12 +100,46 @@ where
         termios.set_canonical_mode(on);
         termios.apply(fd)
     }
+
+    pub async fn input_password(&mut self, prefix: Option<&str>) -> io::Result<String> {
+        let fd = self.input.as_raw_fd();
+        let mut termios = Termios::from_raw_fd(fd)?;
+        let saved_state = termios.clone();
+
+        // Do not echo the characters written
+        termios.set_local_echo(false);
+        termios.apply(fd)?;
+
+        // Print a prefix if requested
+        if let Some(prefix) = prefix {
+            self.write_all(prefix.as_bytes())?;
+            self.flush()?;
+        }
+
+        // Read password from the terminal and convert it to UTF-8
+        let mut password = [0; 256];
+        let n = self.read(&mut password).await?;
+        writeln!(self)?;
+
+        // The password read from the terminal will contain a trailing newline, so remove it
+        let password = std::str::from_utf8(&password[..n])
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "password is not valid UTF-8")
+            })?
+            .trim_end_matches(['\n', '\r']);
+
+        // Restore the terminal's state
+        saved_state.apply(fd)?;
+
+        Ok(password.to_string())
+    }
 }
 
 #[pinned_drop]
 impl<I, O> PinnedDrop for Terminal<I, O>
 where
-    I: AsyncRead + AsRawFd,
+    I: AsyncRead + AsRawFd + Unpin,
+    O: Write,
 {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
@@ -104,7 +153,8 @@ where
 
 impl<I, O> AsyncRead for Terminal<I, O>
 where
-    I: AsyncRead + AsRawFd,
+    I: AsyncRead + AsRawFd + Unpin,
+    O: Write,
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -119,7 +169,7 @@ where
 
 impl<I, O> Write for Terminal<I, O>
 where
-    I: AsyncRead + AsRawFd,
+    I: AsyncRead + AsRawFd + Unpin,
     O: Write,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
