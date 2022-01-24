@@ -37,7 +37,10 @@ impl AsyncReadWrite for TcpStream {}
 impl AsyncReadWrite for Session {}
 
 fn main() -> Result<()> {
-    let runtime = Builder::new_current_thread().thread_name("rutty").build()?;
+    let runtime = Builder::new_current_thread()
+        .thread_name("rutty")
+        .enable_all()
+        .build()?;
 
     runtime.block_on(async { run().await })?;
 
@@ -67,8 +70,6 @@ async fn run() -> Result<()> {
             baud_rate,
             parameters,
         } => {
-            writeln!(terminal, "Opening {}...", &device.display())?;
-
             let (bits, parity, stops) = cli::parse_serial_parameters(&parameters)
                 .ok_or_else(|| anyhow!("Invalid parameter string: {}", parameters))?;
 
@@ -87,8 +88,6 @@ async fn run() -> Result<()> {
             Box::new(port)
         }
         Connection::Tcp { address } => {
-            writeln!(terminal, "Connecting to {}...", address)?;
-
             let stream = TcpStream::connect(&address)
                 .await
                 .with_context(|| format!("Could not connect to {}", &address))?;
