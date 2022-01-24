@@ -19,7 +19,7 @@ use zeroize::Zeroize;
 use crate::{
     cli::{Connection, EscapeDetector, Opts, TristateOpt},
     serial::SerialPort,
-    ssh::Session,
+    ssh::{Channel, Session},
     tty::Terminal,
 };
 
@@ -34,7 +34,7 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
 
 impl AsyncReadWrite for SerialPort {}
 impl AsyncReadWrite for TcpStream {}
-impl AsyncReadWrite for Session {}
+impl AsyncReadWrite for Channel {}
 
 fn main() -> Result<()> {
     let runtime = Builder::new_current_thread()
@@ -107,44 +107,50 @@ async fn run() -> Result<()> {
                 },
             };
 
-            let mut session = Session::new((address.as_str(), opts.port))
+            let session = Session::new((address.as_str(), opts.port))
                 .await
                 .with_context(|| format!("Could not connect to {}", &address))?;
 
             // Authenticate with the server.
             // Try using the agent first, and fallback on password authentication.
-            if session.authenticate_with_agent(&username).is_err() {
-                // Show a prompt to the user
-                write!(terminal, "Password: ")?;
-                terminal.flush()?;
+            let mut channel = match session.authenticate_with_agent(&username).await {
+                Ok(channel) => channel,
+                Err(_) => {
+                    // Show a prompt to the user
+                    write!(terminal, "Password: ")?;
+                    terminal.flush()?;
 
-                let mut password = terminal.input_password().await?;
-                let res = session.authenticate_with_password(&username, &password);
+                    let mut password = terminal.input_password().await?;
+                    writeln!(terminal)?;
 
-                // Securely clear password from memory
-                password.zeroize();
+                    let channel = session
+                        .authenticate_with_password(&username, &password)
+                        .await;
 
-                writeln!(terminal)?;
-                res?;
-            }
+                    // Securely clear password from memory
+                    password.zeroize();
+
+                    channel?
+                }
+            };
 
             if let Some((command, args)) = command.split_first() {
                 // Run the command and print the output.
                 // Don't bother exiting early here, the SSH channel will receive a EOF anyway.
-                let output = session.run(command, args).await?;
-                write!(terminal, "{}", output)?;
+                let output = channel.run(command, args).await?;
+                terminal.write_all(output.as_bytes())?;
             } else {
                 // After authentication, create the virtual terminal and the shell
                 let size = terminal.get_size()?;
-                session.request_pty(size)?;
-                session.shell()?;
+                channel.request_pty(size).await?;
+                channel.shell().await?;
             }
 
             // SSH shells require a raw TTY
             cli.canonical.prefer(TristateOpt::Off);
             cli.local_echo.prefer(TristateOpt::Off);
 
-            Box::new(session)
+            Box::new(channel)
         }
     };
 
