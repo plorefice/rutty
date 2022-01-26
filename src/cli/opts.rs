@@ -1,13 +1,8 @@
-//! The tool's command line interface description.
-
 use std::{path::PathBuf, str::FromStr};
 
 use structopt::StructOpt;
 
 use crate::serial::{DataBits, Parity, StopBits};
-
-/// If this byte is detected as input, the program will quit.
-pub const ESCAPE_BYTE: u8 = 0x1d;
 
 /// A structure built from command-line options.
 #[derive(Debug, StructOpt)]
@@ -119,46 +114,46 @@ pub enum Connection {
         address: String,
     },
     /// Open a shell or run a command over SSH on a remote host.
-    Ssh {
-        /// Destination of the remote host.
-        ///
-        /// The recognized format is [user@]host.
-        /// The host can be either an IP address or a hostname.
-        destination: String,
-
-        /// Command to run on the remote host, including arguments.
-        command: Vec<String>,
-
-        /// SSH connection options.
-        #[structopt(flatten)]
-        opts: SshOptions,
-    },
+    Ssh(SshConnection),
+    /// Transfer files to and from a remote host.
+    Scp(ScpTransfer),
 }
 
-// TODO: putting a doc comment here conflicts with StructOpt documentation.
-#[allow(missing_docs)]
+#[derive(Debug, StructOpt)]
+pub struct SshConnection {
+    /// Destination of the remote host.
+    ///
+    /// The recognized format is [user@]host.
+    /// The host can be either an IP address or a hostname.
+    pub destination: String,
+
+    /// Command to run on the remote host, including arguments.
+    pub command: Vec<String>,
+
+    /// SSH connection options.
+    #[structopt(flatten)]
+    pub opts: SshOptions,
+}
+
+#[derive(Debug, StructOpt)]
+pub struct ScpTransfer {
+    /// Source files to be transferred.
+    #[structopt(required = true)]
+    pub sources: Vec<String>,
+
+    /// Target destination.
+    pub target: String,
+
+    /// SSH connection options.
+    #[structopt(flatten)]
+    pub opts: SshOptions,
+}
+
 #[derive(Debug, StructOpt)]
 pub struct SshOptions {
     /// Remote port to connect to.
     #[structopt(short, long, default_value = "22")]
     pub port: u16,
-}
-
-/// Utility to recognize if the escape byte has been entered the specified number of times.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EscapeDetector(u32);
-
-impl EscapeDetector {
-    /// Feeds a new byte to the detector and returns true if the specified number of consecutive
-    /// escape bytes have been detected.
-    pub fn feed(&mut self, byte: u8) -> bool {
-        if byte == ESCAPE_BYTE {
-            self.0 += 1;
-        } else {
-            self.0 = 0;
-        }
-        self.0 == 1
-    }
 }
 
 /// Parses a serial parameter string comprised of data bits, parity and stop bits in canonical
