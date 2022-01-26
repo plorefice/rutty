@@ -3,7 +3,8 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    os::unix::prelude::AsRawFd,
+    os::{linux::fs::MetadataExt, unix::prelude::AsRawFd},
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -13,7 +14,10 @@ use anyhow::Result;
 use async_io::Async;
 use futures::ready;
 use ssh2::{PtyModeOpcode, PtyModes};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+};
 
 /// A reference to an established SSH session with a remote host.
 pub struct Session {
@@ -55,6 +59,47 @@ impl Session {
             .await?;
 
         self.create_channel().await
+    }
+
+    /// Uploads a local file to the remote host.
+    pub async fn upload<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
+    where
+        L: AsRef<Path>,
+        R: AsRef<Path>,
+    {
+        let mut local_file = File::open(local_path).await?;
+
+        // Preserve metadata by default
+        let meta = local_file.metadata().await?;
+        let (mode, size, times) = (
+            meta.st_mode() as i32 & 0o777,
+            meta.st_size(),
+            Some((meta.st_mtime() as u64, meta.st_atime() as u64)),
+        );
+
+        let channel = self
+            .inner
+            .run(|session| session.scp_send(remote_path.as_ref(), mode, size, times))
+            .await?;
+
+        let mut remote_file = Channel {
+            inner: channel,
+            session: self.inner.clone(),
+        };
+
+        tokio::io::copy(&mut local_file, &mut remote_file).await?;
+
+        self.inner
+            .run(|_| {
+                remote_file.inner.send_eof()?;
+                remote_file.inner.wait_eof()?;
+                remote_file.inner.close()?;
+                remote_file.inner.wait_close()?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(())
     }
 
     /// Create a new channel and set the session as non-blocking.
