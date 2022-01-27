@@ -64,6 +64,9 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
             None => (None, source.as_str()),
         };
 
+        // TODO: show progress for each transfer
+        writeln!(term, "{}", source_path)?;
+
         match (source_sftp, &target_sftp) {
             (None, Some(sftp)) => {
                 sftp.upload(source_path, target_path).await?;
