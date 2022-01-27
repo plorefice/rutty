@@ -63,10 +63,15 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
         };
 
         match (source_session, &target_session) {
-            (None, Some(target)) => target.upload(source_path, target_path).await?,
+            (None, Some(target)) => {
+                target.upload(source_path, target_path).await?;
+            }
             (Some(_), None) => todo!(),
-            (Some(_), Some(_)) => todo!(),
-            (None, None) => bail!("at least one between source and target must be a remote host"),
+            (None, None) => {
+                // A local copy is performed if neither source nor target are remote hosts
+                tokio::fs::copy(source_path, target_path).await?;
+            }
+            (Some(_), Some(_)) => bail!("Cannot transfer files between two remote hosts"),
         }
     }
 

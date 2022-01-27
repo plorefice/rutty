@@ -3,19 +3,20 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    os::{linux::fs::MetadataExt, unix::prelude::AsRawFd},
-    path::Path,
+    os::unix::prelude::AsRawFd,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_io::Async;
 use futures::ready;
-use ssh2::{PtyModeOpcode, PtyModes};
+use nix::NixPath;
+use ssh2::{ErrorCode, PtyModeOpcode, PtyModes};
 use tokio::{
-    fs::File,
+    fs,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
 };
 
@@ -61,43 +62,37 @@ impl Session {
         self.create_channel().await
     }
 
-    /// Uploads a local file to the remote host.
+    /// Uploads a local file to the remote host using the SFTP protocol.
     pub async fn upload<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
     where
         L: AsRef<Path>,
         R: AsRef<Path>,
     {
-        let mut local_file = File::open(local_path).await?;
+        let sftp = self.inner.run(|session| session.sftp()).await?;
 
-        // Preserve metadata by default
-        let meta = local_file.metadata().await?;
-        let (mode, size, times) = (
-            meta.st_mode() as i32 & 0o777,
-            meta.st_size(),
-            Some((meta.st_mtime() as u64, meta.st_atime() as u64)),
-        );
+        let mut local_file = fs::File::open(&local_path).await?;
 
-        let channel = self
-            .inner
-            .run(|session| session.scp_send(remote_path.as_ref(), mode, size, times))
-            .await?;
+        let file_name = local_path
+            .as_ref()
+            .file_name()
+            .ok_or(anyhow!("invalid file name"))?;
 
-        let mut remote_file = Channel {
-            inner: channel,
+        // Prepare the remote path to be handled correctly by the server
+        let remote_path = sanitize_remove_path(remote_path);
+
+        // If the remote path exists and is a directory, create a file with the same name in it.
+        // If not, use the remote path as is.
+        let remote_path = match self.inner.run(|_| sftp.stat(remote_path.as_ref())).await {
+            Ok(stat) if stat.is_dir() => remote_path.join(file_name),
+            Ok(_) | Err(_) => remote_path,
+        };
+
+        let mut remote_file = File {
+            inner: self.inner.run(|_| sftp.create(&remote_path)).await?,
             session: self.inner.clone(),
         };
 
         tokio::io::copy(&mut local_file, &mut remote_file).await?;
-
-        self.inner
-            .run(|_| {
-                remote_file.inner.send_eof()?;
-                remote_file.inner.wait_eof()?;
-                remote_file.inner.close()?;
-                remote_file.inner.wait_close()?;
-                Ok(())
-            })
-            .await?;
 
         Ok(())
     }
@@ -215,6 +210,60 @@ impl AsyncWrite for Channel {
     }
 }
 
+/// Handle to a remote file obtained via SFTP.
+struct File {
+    inner: ssh2::File,
+    session: AsyncSession,
+}
+
+impl AsyncRead for File {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            match self.inner.read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.session.poll_readable(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for File {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        loop {
+            match self.inner.write(buf) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.session.poll_writable(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.inner.flush())
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // TODO: implement graceful shutdown
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Wrapper around a libssh2 `Session` providing an async interface to non-blocking operations.
 #[derive(Clone)]
 struct AsyncSession {
@@ -256,23 +305,45 @@ impl AsyncSession {
             loop {
                 match f(&self.inner) {
                     Ok(res) => break Ok(res),
-                    Err(e) => match self.inner.block_directions() {
-                        ssh2::BlockDirections::None => {
-                            break Err(e.into());
+                    // The hard-coded number is ugly as hell, but ssh2 does not re-export the
+                    // error codes from the C library, so... *shrug*
+                    Err(e) if e.code() == ErrorCode::Session(-37) => {
+                        match self.inner.block_directions() {
+                            ssh2::BlockDirections::Inbound => {
+                                self.stream.readable().await?;
+                            }
+                            ssh2::BlockDirections::Outbound => {
+                                self.stream.writable().await?;
+                            }
+                            ssh2::BlockDirections::Both => {
+                                self.stream.readable().await?;
+                                self.stream.writable().await?;
+                            }
+                            ssh2::BlockDirections::None => {
+                                panic!("EAGAIN but should not block")
+                            }
                         }
-                        ssh2::BlockDirections::Inbound => {
-                            self.stream.readable().await?;
-                        }
-                        ssh2::BlockDirections::Outbound => {
-                            self.stream.writable().await?;
-                        }
-                        ssh2::BlockDirections::Both => {
-                            self.stream.readable().await?;
-                            self.stream.writable().await?;
-                        }
-                    },
+                    }
+                    Err(e) => break Err(e.into()),
                 }
             }
         }
     }
+}
+
+/// Canonicalizes a path by removing unwanted prefixes.
+fn sanitize_remove_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let mut path = path.as_ref().to_path_buf();
+
+    // Map empty path or home directory to current directory
+    if path.is_empty() || path == Path::new("~") || path == Path::new(".") {
+        return PathBuf::from(".");
+    }
+
+    // Convert a tilde prefix into current directory
+    if path.starts_with("~") {
+        path = Path::new(".").join(path.strip_prefix("~").unwrap());
+    }
+
+    path
 }
