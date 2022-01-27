@@ -252,7 +252,7 @@ impl Sftp {
 
         // Create directory on the server, if it doesn't exist
         match self.stat(&remote_path).await {
-            Ok(stat) if stat.is_file() => bail!("file exists and is not a directory"),
+            Ok(stat) if !stat.is_dir() => bail!("file exists and is not a directory"),
             Err(_) => self.mkdir(&remote_path, 0o775).await?,
             Ok(_) => (),
         };
@@ -274,6 +274,7 @@ impl Sftp {
     }
 
     /// Uploads a local file to the remote host using the SFTP protocol.
+    #[async_recursion(?Send)]
     pub async fn download<L, R>(&self, remote_path: R, local_path: L) -> Result<()>
     where
         L: AsRef<Path>,
@@ -281,6 +282,11 @@ impl Sftp {
     {
         // Prepare the remote path to be handled correctly by the server
         let remote_path = Self::sanitize_remove_path(remote_path);
+
+        // Use dedicated method to download whole directories
+        if self.stat(&remote_path).await?.is_dir() {
+            return self.download_dir(remote_path, local_path).await;
+        }
 
         let file_name = remote_path
             .file_name()
@@ -297,6 +303,46 @@ impl Sftp {
         let mut remote_file = self.open(remote_path).await?;
 
         tokio::io::copy(&mut remote_file, &mut local_file).await?;
+
+        Ok(())
+    }
+
+    /// Special handling for directory uploads.
+    #[async_recursion(?Send)]
+    async fn download_dir<L, R>(&self, remote_path: R, local_path: L) -> Result<()>
+    where
+        L: AsRef<Path>,
+        R: AsRef<Path>,
+    {
+        let local_path = local_path.as_ref();
+
+        // Prepare the remote path to be handled correctly by the server
+        let remote_path = Self::sanitize_remove_path(remote_path);
+
+        // Always create a new directory, do not copy files in the current directory
+        let local_path = match fs::metadata(local_path).await {
+            Ok(stat) if !stat.is_dir() => bail!("file exists and is not a directory"),
+            Err(_) => local_path.to_path_buf(),
+            Ok(_) => local_path.join(
+                remote_path
+                    .file_name()
+                    .expect("could not retrieve file name"),
+            ),
+        };
+
+        // Create local directory if it doesn't exist
+        if fs::metadata(&local_path).await.is_err() {
+            fs::create_dir(&local_path).await?;
+        }
+
+        for remote_file in self.read_dir(&remote_path).await? {
+            let file_name = remote_file
+                .file_name()
+                .expect("could not retrieve file name");
+
+            self.download(remote_path.join(&remote_file), local_path.join(&file_name))
+                .await?;
+        }
 
         Ok(())
     }
@@ -330,6 +376,24 @@ impl Sftp {
     /// Gets the metadata for a file, performed by stat(2).
     pub async fn stat<P: AsRef<Path>>(&self, path: P) -> Result<ssh2::FileStat> {
         self.session.run(|_| self.inner.stat(path.as_ref())).await
+    }
+
+    /// Opens a file in read-only mode.
+    pub async fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Vec<PathBuf>> {
+        let mut dir = self
+            .session
+            .run(|_| self.inner.opendir(path.as_ref()))
+            .await?;
+
+        let mut ret = Vec::new();
+
+        while let Ok((path, _)) = self.session.run(|_| dir.readdir()).await {
+            if path != Path::new(".") && path != Path::new("..") {
+                ret.push(path);
+            }
+        }
+
+        Ok(ret)
     }
 
     /// Canonicalizes a path by removing unwanted prefixes.
