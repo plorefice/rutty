@@ -62,39 +62,12 @@ impl Session {
         self.create_channel().await
     }
 
-    /// Uploads a local file to the remote host using the SFTP protocol.
-    pub async fn upload<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
-    where
-        L: AsRef<Path>,
-        R: AsRef<Path>,
-    {
-        let sftp = self.inner.run(|session| session.sftp()).await?;
-
-        let mut local_file = fs::File::open(&local_path).await?;
-
-        let file_name = local_path
-            .as_ref()
-            .file_name()
-            .ok_or(anyhow!("invalid file name"))?;
-
-        // Prepare the remote path to be handled correctly by the server
-        let remote_path = sanitize_remove_path(remote_path);
-
-        // If the remote path exists and is a directory, create a file with the same name in it.
-        // If not, use the remote path as is.
-        let remote_path = match self.inner.run(|_| sftp.stat(remote_path.as_ref())).await {
-            Ok(stat) if stat.is_dir() => remote_path.join(file_name),
-            Ok(_) | Err(_) => remote_path,
-        };
-
-        let mut remote_file = File {
-            inner: self.inner.run(|_| sftp.create(&remote_path)).await?,
+    /// Opens a SFTP channel on this session.
+    pub async fn sftp(&self) -> Result<Sftp> {
+        Ok(Sftp {
+            inner: self.inner.run(|session| session.sftp()).await?,
             session: self.inner.clone(),
-        };
-
-        tokio::io::copy(&mut local_file, &mut remote_file).await?;
-
-        Ok(())
+        })
     }
 
     /// Create a new channel and set the session as non-blocking.
@@ -210,8 +183,78 @@ impl AsyncWrite for Channel {
     }
 }
 
+/// Handle to a remote filesystem over SFTP.
+pub struct Sftp {
+    inner: ssh2::Sftp,
+    session: AsyncSession,
+}
+
+impl Sftp {
+    /// Uploads a local file to the remote host using the SFTP protocol.
+    pub async fn upload<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
+    where
+        L: AsRef<Path>,
+        R: AsRef<Path>,
+    {
+        let mut local_file = fs::File::open(&local_path).await?;
+
+        let file_name = local_path
+            .as_ref()
+            .file_name()
+            .ok_or(anyhow!("invalid file name"))?;
+
+        // Prepare the remote path to be handled correctly by the server
+        let remote_path = Self::sanitize_remove_path(remote_path);
+
+        // If the remote path exists and is a directory, create a file with the same name in it.
+        // If not, use the remote path as is.
+        let remote_path = match self.stat(&remote_path).await {
+            Ok(stat) if stat.is_dir() => remote_path.join(file_name),
+            Ok(_) | Err(_) => remote_path,
+        };
+
+        let mut remote_file = self.create(remote_path).await?;
+        tokio::io::copy(&mut local_file, &mut remote_file).await?;
+
+        Ok(())
+    }
+
+    /// Create a file in write-only mode with truncation.
+    async fn create<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+        Ok(File {
+            inner: self
+                .session
+                .run(|_| self.inner.create(path.as_ref()))
+                .await?,
+            session: self.session.clone(),
+        })
+    }
+
+    /// Gets the metadata for a file, performed by stat(2).
+    async fn stat<P: AsRef<Path>>(&self, path: P) -> Result<ssh2::FileStat> {
+        self.session.run(|_| self.inner.stat(path.as_ref())).await
+    }
+
+    /// Canonicalizes a path by removing unwanted prefixes.
+    fn sanitize_remove_path<P: AsRef<Path>>(path: P) -> PathBuf {
+        let mut path = path.as_ref().to_path_buf();
+
+        // Map empty path or home directory to current directory
+        if path.is_empty() || path == Path::new("~") || path == Path::new(".") {
+            return PathBuf::from(".");
+        }
+
+        // Convert a tilde prefix into current directory
+        if path.starts_with("~") {
+            path = Path::new(".").join(path.strip_prefix("~").unwrap());
+        }
+
+        path
+    }
+}
+
 /// Handle to a remote file obtained via SFTP.
-struct File {
+pub struct File {
     inner: ssh2::File,
     session: AsyncSession,
 }
@@ -329,21 +372,4 @@ impl AsyncSession {
             }
         }
     }
-}
-
-/// Canonicalizes a path by removing unwanted prefixes.
-fn sanitize_remove_path<P: AsRef<Path>>(path: P) -> PathBuf {
-    let mut path = path.as_ref().to_path_buf();
-
-    // Map empty path or home directory to current directory
-    if path.is_empty() || path == Path::new("~") || path == Path::new(".") {
-        return PathBuf::from(".");
-    }
-
-    // Convert a tilde prefix into current directory
-    if path.starts_with("~") {
-        path = Path::new(".").join(path.strip_prefix("~").unwrap());
-    }
-
-    path
 }

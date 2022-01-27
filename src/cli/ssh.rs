@@ -45,24 +45,26 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
         _ => panic!("unexpected connection type"),
     };
 
-    let (target_session, target_path) = match scp.target.split_once(':') {
+    let (target_sftp, target_path) = match scp.target.split_once(':') {
         Some((remote, path)) => {
             let (session, _) = establish_ssh_session(term, remote, scp.opts.port).await?;
-            (Some(session), path)
+            let sftp = session.sftp().await?;
+            (Some(sftp), path)
         }
         None => (None, scp.target.as_str()),
     };
 
     for source in &scp.sources {
-        let (source_session, source_path) = match source.split_once(':') {
+        let (source_sftp, source_path) = match source.split_once(':') {
             Some((remote, path)) => {
                 let (session, _) = establish_ssh_session(term, remote, scp.opts.port).await?;
-                (Some(session), path)
+                let sftp = session.sftp().await?;
+                (Some(sftp), path)
             }
             None => (None, source.as_str()),
         };
 
-        match (source_session, &target_session) {
+        match (source_sftp, &target_sftp) {
             (None, Some(target)) => {
                 target.upload(source_path, target_path).await?;
             }
