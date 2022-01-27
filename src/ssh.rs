@@ -10,8 +10,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use async_io::Async;
+use async_recursion::async_recursion;
 use futures::ready;
 use nix::NixPath;
 use ssh2::{ErrorCode, PtyModeOpcode, PtyModes};
@@ -191,6 +192,7 @@ pub struct Sftp {
 
 impl Sftp {
     /// Uploads a local file to the remote host using the SFTP protocol.
+    #[async_recursion(?Send)]
     pub async fn upload<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
     where
         L: AsRef<Path>,
@@ -198,10 +200,15 @@ impl Sftp {
     {
         let mut local_file = fs::File::open(&local_path).await?;
 
+        // Use dedicated method to upload whole directories
+        if local_file.metadata().await?.is_dir() {
+            return self.upload_dir(local_path, remote_path).await;
+        }
+
         let file_name = local_path
             .as_ref()
             .file_name()
-            .ok_or(anyhow!("invalid file name"))?;
+            .expect("could not retrieve file name");
 
         // Prepare the remote path to be handled correctly by the server
         let remote_path = Self::sanitize_remove_path(remote_path);
@@ -216,6 +223,52 @@ impl Sftp {
         let mut remote_file = self.create(remote_path).await?;
 
         tokio::io::copy(&mut local_file, &mut remote_file).await?;
+
+        Ok(())
+    }
+
+    /// Special handling for directory uploads.
+    #[async_recursion(?Send)]
+    async fn upload_dir<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
+    where
+        L: AsRef<Path>,
+        R: AsRef<Path>,
+    {
+        let local_path = local_path.as_ref();
+
+        let dir_name = local_path
+            .file_name()
+            .expect("could not retrieve file name");
+
+        // Prepare the remote path to be handled correctly by the server
+        let remote_path = Self::sanitize_remove_path(remote_path);
+
+        // If the remote path exists and is a directory, create a file with the same name in it.
+        // If not, use the remote path as is.
+        let remote_path = match self.stat(&remote_path).await {
+            Ok(stat) if stat.is_dir() => remote_path.join(dir_name),
+            Ok(_) | Err(_) => remote_path,
+        };
+
+        // Create directory on the server, if it doesn't exist
+        match self.stat(&remote_path).await {
+            Ok(stat) if stat.is_file() => bail!("file exists and is not a directory"),
+            Err(_) => self.mkdir(&remote_path, 0o775).await?,
+            Ok(_) => (),
+        };
+
+        let mut local_dir = fs::read_dir(&local_path).await?;
+
+        while let Some(local_file) = local_dir.next_entry().await? {
+            let file_name = local_file
+                .path()
+                .file_name()
+                .expect("could not retrieve file name")
+                .to_owned();
+
+            self.upload(local_path.join(&file_name), remote_path.join(&file_name))
+                .await?;
+        }
 
         Ok(())
     }
@@ -265,6 +318,13 @@ impl Sftp {
                 .await?,
             session: self.session.clone(),
         })
+    }
+
+    /// Creates a directory on the remote file system.
+    pub async fn mkdir<P: AsRef<Path>>(&self, path: P, mode: i32) -> Result<()> {
+        self.session
+            .run(|_| self.inner.mkdir(path.as_ref(), mode))
+            .await
     }
 
     /// Gets the metadata for a file, performed by stat(2).
