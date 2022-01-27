@@ -214,13 +214,50 @@ impl Sftp {
         };
 
         let mut remote_file = self.create(remote_path).await?;
+
         tokio::io::copy(&mut local_file, &mut remote_file).await?;
 
         Ok(())
     }
 
-    /// Create a file in write-only mode with truncation.
-    async fn create<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+    /// Uploads a local file to the remote host using the SFTP protocol.
+    pub async fn download<L, R>(&self, remote_path: R, local_path: L) -> Result<()>
+    where
+        L: AsRef<Path>,
+        R: AsRef<Path>,
+    {
+        // Prepare the remote path to be handled correctly by the server
+        let remote_path = Self::sanitize_remove_path(remote_path);
+
+        let file_name = remote_path
+            .file_name()
+            .ok_or(anyhow!("invalid file name"))?;
+
+        // If the local path exists and is a directory, create a file with the same name in it.
+        // If not, use the local path as is.
+        let local_path = match fs::metadata(&local_path).await {
+            Ok(stat) if stat.is_dir() => local_path.as_ref().join(file_name),
+            Ok(_) | Err(_) => local_path.as_ref().into(),
+        };
+
+        let mut local_file = fs::File::create(&local_path).await?;
+        let mut remote_file = self.open(remote_path).await?;
+
+        tokio::io::copy(&mut remote_file, &mut local_file).await?;
+
+        Ok(())
+    }
+
+    /// Opens a file in read-only mode.
+    pub async fn open<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+        Ok(File {
+            inner: self.session.run(|_| self.inner.open(path.as_ref())).await?,
+            session: self.session.clone(),
+        })
+    }
+
+    /// Creates a file in write-only mode with truncation.
+    pub async fn create<P: AsRef<Path>>(&self, path: P) -> Result<File> {
         Ok(File {
             inner: self
                 .session
@@ -231,7 +268,7 @@ impl Sftp {
     }
 
     /// Gets the metadata for a file, performed by stat(2).
-    async fn stat<P: AsRef<Path>>(&self, path: P) -> Result<ssh2::FileStat> {
+    pub async fn stat<P: AsRef<Path>>(&self, path: P) -> Result<ssh2::FileStat> {
         self.session.run(|_| self.inner.stat(path.as_ref())).await
     }
 

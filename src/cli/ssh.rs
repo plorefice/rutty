@@ -65,10 +65,12 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
         };
 
         match (source_sftp, &target_sftp) {
-            (None, Some(target)) => {
-                target.upload(source_path, target_path).await?;
+            (None, Some(sftp)) => {
+                sftp.upload(source_path, target_path).await?;
             }
-            (Some(_), None) => todo!(),
+            (Some(sftp), None) => {
+                sftp.download(source_path, target_path).await?;
+            }
             (None, None) => {
                 // A local copy is performed if neither source nor target are remote hosts
                 tokio::fs::copy(source_path, target_path).await?;
