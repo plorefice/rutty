@@ -10,16 +10,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use async_io::Async;
 use async_recursion::async_recursion;
 use futures::ready;
-use nix::NixPath;
-use ssh2::{ErrorCode, PtyModeOpcode, PtyModes};
-use tokio::{
-    fs,
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-};
+use ssh2::{ErrorCode, FileStat, PtyModeOpcode, PtyModes};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 const DEFAULT_BUF_SIZE: usize = 1024 * 1024;
 
@@ -195,35 +191,12 @@ pub struct Sftp {
 }
 
 impl Sftp {
-    /// Uploads a local file to the remote host using the SFTP protocol.
-    #[async_recursion(?Send)]
-    pub async fn upload<L, R>(&mut self, local_path: L, remote_path: R) -> Result<()>
+    /// Creates a file on the remote host from a stream of bytes using the SFTP protocol.
+    pub async fn upload<P, R>(&mut self, remote_path: P, source: &mut R) -> Result<()>
     where
-        L: AsRef<Path>,
-        R: AsRef<Path>,
+        R: AsyncRead + Unpin,
+        P: AsRef<Path>,
     {
-        let mut local_file = fs::File::open(&local_path).await?;
-
-        // Use dedicated method to upload whole directories
-        if local_file.metadata().await?.is_dir() {
-            return self.upload_dir(local_path, remote_path).await;
-        }
-
-        let file_name = local_path
-            .as_ref()
-            .file_name()
-            .expect("could not retrieve file name");
-
-        // Prepare the remote path to be handled correctly by the server
-        let remote_path = Self::sanitize_remove_path(remote_path);
-
-        // If the remote path exists and is a directory, create a file with the same name in it.
-        // If not, use the remote path as is.
-        let remote_path = match self.stat(&remote_path).await {
-            Ok(stat) if stat.is_dir() => remote_path.join(file_name),
-            Ok(_) | Err(_) => remote_path,
-        };
-
         let mut remote_file = self.create(remote_path).await?;
 
         let mut buf = ReadBuf::new(&mut self.netbuf);
@@ -234,7 +207,7 @@ impl Sftp {
             // Since the bottleneck for this operation is either the link speed or the RTT between
             // an SFTP chunk and its ACK, we want to send as much data as possible in a transfer.
             while buf.filled().len() < 1024 * 1024 {
-                match local_file.read(buf.initialize_unfilled()).await {
+                match source.read(buf.initialize_unfilled()).await {
                     Ok(0) => break,
                     Ok(n) => buf.advance(n),
                     Err(e) => return Err(e.into()),
@@ -252,79 +225,13 @@ impl Sftp {
         }
     }
 
-    /// Special handling for directory uploads.
+    /// Downloads the contents of a file to the remote host using the SFTP protocol.
     #[async_recursion(?Send)]
-    async fn upload_dir<L, R>(&mut self, local_path: L, remote_path: R) -> Result<()>
+    pub async fn download<P, W>(&mut self, remote_path: P, dest: &mut W) -> Result<()>
     where
-        L: AsRef<Path>,
-        R: AsRef<Path>,
+        W: AsyncWrite + Unpin,
+        P: AsRef<Path>,
     {
-        let local_path = local_path.as_ref();
-
-        let dir_name = local_path
-            .file_name()
-            .expect("could not retrieve file name");
-
-        // Prepare the remote path to be handled correctly by the server
-        let remote_path = Self::sanitize_remove_path(remote_path);
-
-        // If the remote path exists and is a directory, create a file with the same name in it.
-        // If not, use the remote path as is.
-        let remote_path = match self.stat(&remote_path).await {
-            Ok(stat) if stat.is_dir() => remote_path.join(dir_name),
-            Ok(_) | Err(_) => remote_path,
-        };
-
-        // Create directory on the server, if it doesn't exist
-        match self.stat(&remote_path).await {
-            Ok(stat) if !stat.is_dir() => bail!("file exists and is not a directory"),
-            Err(_) => self.mkdir(&remote_path, 0o775).await?,
-            Ok(_) => (),
-        };
-
-        let mut local_dir = fs::read_dir(&local_path).await?;
-
-        while let Some(local_file) = local_dir.next_entry().await? {
-            let file_name = local_file
-                .path()
-                .file_name()
-                .expect("could not retrieve file name")
-                .to_owned();
-
-            self.upload(local_path.join(&file_name), remote_path.join(&file_name))
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Uploads a local file to the remote host using the SFTP protocol.
-    #[async_recursion(?Send)]
-    pub async fn download<L, R>(&mut self, remote_path: R, local_path: L) -> Result<()>
-    where
-        L: AsRef<Path>,
-        R: AsRef<Path>,
-    {
-        // Prepare the remote path to be handled correctly by the server
-        let remote_path = Self::sanitize_remove_path(remote_path);
-
-        // Use dedicated method to download whole directories
-        if self.stat(&remote_path).await?.is_dir() {
-            return self.download_dir(remote_path, local_path).await;
-        }
-
-        let file_name = remote_path
-            .file_name()
-            .ok_or(anyhow!("invalid file name"))?;
-
-        // If the local path exists and is a directory, create a file with the same name in it.
-        // If not, use the local path as is.
-        let local_path = match fs::metadata(&local_path).await {
-            Ok(stat) if stat.is_dir() => local_path.as_ref().join(file_name),
-            Ok(_) | Err(_) => local_path.as_ref().into(),
-        };
-
-        let mut local_file = fs::File::create(&local_path).await?;
         let mut remote_file = self.open(remote_path).await?;
 
         loop {
@@ -332,50 +239,10 @@ impl Sftp {
             // buffer size. Doing the read-write loop by hand is one order of magnitude faster.
             match remote_file.read(&mut self.netbuf).await {
                 Ok(0) => return Ok(()),
-                Ok(n) => local_file.write_all(&self.netbuf[..n]).await?,
+                Ok(n) => dest.write_all(&self.netbuf[..n]).await?,
                 Err(e) => return Err(e.into()),
             }
         }
-    }
-
-    /// Special handling for directory uploads.
-    #[async_recursion(?Send)]
-    async fn download_dir<L, R>(&mut self, remote_path: R, local_path: L) -> Result<()>
-    where
-        L: AsRef<Path>,
-        R: AsRef<Path>,
-    {
-        let local_path = local_path.as_ref();
-
-        // Prepare the remote path to be handled correctly by the server
-        let remote_path = Self::sanitize_remove_path(remote_path);
-
-        // Always create a new directory, do not copy files in the current directory
-        let local_path = match fs::metadata(local_path).await {
-            Ok(stat) if !stat.is_dir() => bail!("file exists and is not a directory"),
-            Err(_) => local_path.to_path_buf(),
-            Ok(_) => local_path.join(
-                remote_path
-                    .file_name()
-                    .expect("could not retrieve file name"),
-            ),
-        };
-
-        // Create local directory if it doesn't exist
-        if fs::metadata(&local_path).await.is_err() {
-            fs::create_dir(&local_path).await?;
-        }
-
-        for remote_file in self.read_dir(&remote_path).await? {
-            let file_name = remote_file
-                .file_name()
-                .expect("could not retrieve file name");
-
-            self.download(remote_path.join(&remote_file), local_path.join(&file_name))
-                .await?;
-        }
-
-        Ok(())
     }
 
     /// Opens a file in read-only mode.
@@ -426,29 +293,19 @@ impl Sftp {
 
         Ok(ret)
     }
-
-    /// Canonicalizes a path by removing unwanted prefixes.
-    fn sanitize_remove_path<P: AsRef<Path>>(path: P) -> PathBuf {
-        let mut path = path.as_ref().to_path_buf();
-
-        // Map empty path or home directory to current directory
-        if path.is_empty() || path == Path::new("~") || path == Path::new(".") {
-            return PathBuf::from(".");
-        }
-
-        // Convert a tilde prefix into current directory
-        if path.starts_with("~") {
-            path = Path::new(".").join(path.strip_prefix("~").unwrap());
-        }
-
-        path
-    }
 }
 
 /// Handle to a remote file obtained via SFTP.
 pub struct File {
     inner: ssh2::File,
     session: AsyncSession,
+}
+
+impl File {
+    /// Retrieves the metadata associated to this file.
+    pub async fn stat(&mut self) -> Result<FileStat> {
+        self.session.run(|_| self.inner.stat()).await
+    }
 }
 
 impl AsyncRead for File {
