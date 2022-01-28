@@ -4,6 +4,7 @@ use std::{
     io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     os::unix::prelude::AsRawFd,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -11,9 +12,12 @@ use std::{
 
 use anyhow::Result;
 use async_io::Async;
+use async_recursion::async_recursion;
 use futures::ready;
-use ssh2::{PtyModeOpcode, PtyModes};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use ssh2::{ErrorCode, FileStat, PtyModeOpcode, PtyModes};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+const DEFAULT_BUF_SIZE: usize = 1024 * 1024;
 
 /// A reference to an established SSH session with a remote host.
 pub struct Session {
@@ -55,6 +59,15 @@ impl Session {
             .await?;
 
         self.create_channel().await
+    }
+
+    /// Opens a SFTP channel on this session.
+    pub async fn sftp(&self) -> Result<Sftp> {
+        Ok(Sftp {
+            inner: self.inner.run(|session| session.sftp()).await?,
+            session: self.inner.clone(),
+            netbuf: vec![0; DEFAULT_BUF_SIZE],
+        })
     }
 
     /// Create a new channel and set the session as non-blocking.
@@ -170,6 +183,179 @@ impl AsyncWrite for Channel {
     }
 }
 
+/// Handle to a remote filesystem over SFTP.
+pub struct Sftp {
+    inner: ssh2::Sftp,
+    session: AsyncSession,
+    netbuf: Vec<u8>,
+}
+
+impl Sftp {
+    /// Creates a file on the remote host from a stream of bytes using the SFTP protocol.
+    pub async fn upload<P, R>(&mut self, remote_path: P, source: &mut R) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        P: AsRef<Path>,
+    {
+        let mut remote_file = self.create(remote_path).await?;
+
+        let mut buf = ReadBuf::new(&mut self.netbuf);
+
+        loop {
+            // The goal here is to try to maximize the amount of bytes read from the local
+            // filesystem before sending them over the SSH connection.
+            // Since the bottleneck for this operation is either the link speed or the RTT between
+            // an SFTP chunk and its ACK, we want to send as much data as possible in a transfer.
+            while buf.filled().len() < 1024 * 1024 {
+                match source.read(buf.initialize_unfilled()).await {
+                    Ok(0) => break,
+                    Ok(n) => buf.advance(n),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // EOF from local file
+            if buf.filled().is_empty() {
+                return Ok(());
+            }
+
+            remote_file.write_all(buf.filled()).await?;
+
+            buf.clear();
+        }
+    }
+
+    /// Downloads the contents of a file to the remote host using the SFTP protocol.
+    #[async_recursion(?Send)]
+    pub async fn download<P, W>(&mut self, remote_path: P, dest: &mut W) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+        P: AsRef<Path>,
+    {
+        let mut remote_file = self.open(remote_path).await?;
+
+        loop {
+            // Same as for the upload, tokio::io::copy is abysmally slow due to very small default
+            // buffer size. Doing the read-write loop by hand is one order of magnitude faster.
+            match remote_file.read(&mut self.netbuf).await {
+                Ok(0) => return Ok(()),
+                Ok(n) => dest.write_all(&self.netbuf[..n]).await?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Opens a file in read-only mode.
+    pub async fn open<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+        Ok(File {
+            inner: self.session.run(|_| self.inner.open(path.as_ref())).await?,
+            session: self.session.clone(),
+        })
+    }
+
+    /// Creates a file in write-only mode with truncation.
+    pub async fn create<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+        Ok(File {
+            inner: self
+                .session
+                .run(|_| self.inner.create(path.as_ref()))
+                .await?,
+            session: self.session.clone(),
+        })
+    }
+
+    /// Creates a directory on the remote file system.
+    pub async fn mkdir<P: AsRef<Path>>(&self, path: P, mode: i32) -> Result<()> {
+        self.session
+            .run(|_| self.inner.mkdir(path.as_ref(), mode))
+            .await
+    }
+
+    /// Gets the metadata for a file, performed by stat(2).
+    pub async fn stat<P: AsRef<Path>>(&self, path: P) -> Result<ssh2::FileStat> {
+        self.session.run(|_| self.inner.stat(path.as_ref())).await
+    }
+
+    /// Opens a file in read-only mode.
+    pub async fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Vec<PathBuf>> {
+        let mut dir = self
+            .session
+            .run(|_| self.inner.opendir(path.as_ref()))
+            .await?;
+
+        let mut ret = Vec::new();
+
+        while let Ok((path, _)) = self.session.run(|_| dir.readdir()).await {
+            if path != Path::new(".") && path != Path::new("..") {
+                ret.push(path);
+            }
+        }
+
+        Ok(ret)
+    }
+}
+
+/// Handle to a remote file obtained via SFTP.
+pub struct File {
+    inner: ssh2::File,
+    session: AsyncSession,
+}
+
+impl File {
+    /// Retrieves the metadata associated to this file.
+    pub async fn stat(&mut self) -> Result<FileStat> {
+        self.session.run(|_| self.inner.stat()).await
+    }
+}
+
+impl AsyncRead for File {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            match self.inner.read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.session.poll_readable(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for File {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        loop {
+            match self.inner.write(buf) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.session.poll_writable(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.inner.flush())
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // TODO: implement graceful shutdown
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Wrapper around a libssh2 `Session` providing an async interface to non-blocking operations.
 #[derive(Clone)]
 struct AsyncSession {
@@ -211,21 +397,26 @@ impl AsyncSession {
             loop {
                 match f(&self.inner) {
                     Ok(res) => break Ok(res),
-                    Err(e) => match self.inner.block_directions() {
-                        ssh2::BlockDirections::None => {
-                            break Err(e.into());
+                    // The hard-coded number is ugly as hell, but ssh2 does not re-export the
+                    // error codes from the C library, so... *shrug*
+                    Err(e) if e.code() == ErrorCode::Session(-37) => {
+                        match self.inner.block_directions() {
+                            ssh2::BlockDirections::Inbound => {
+                                self.stream.readable().await?;
+                            }
+                            ssh2::BlockDirections::Outbound => {
+                                self.stream.writable().await?;
+                            }
+                            ssh2::BlockDirections::Both => {
+                                self.stream.readable().await?;
+                                self.stream.writable().await?;
+                            }
+                            ssh2::BlockDirections::None => {
+                                panic!("EAGAIN but should not block")
+                            }
                         }
-                        ssh2::BlockDirections::Inbound => {
-                            self.stream.readable().await?;
-                        }
-                        ssh2::BlockDirections::Outbound => {
-                            self.stream.writable().await?;
-                        }
-                        ssh2::BlockDirections::Both => {
-                            self.stream.readable().await?;
-                            self.stream.writable().await?;
-                        }
-                    },
+                    }
+                    Err(e) => break Err(e.into()),
                 }
             }
         }
