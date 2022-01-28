@@ -45,7 +45,7 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
         _ => panic!("unexpected connection type"),
     };
 
-    let (target_sftp, target_path) = match scp.target.split_once(':') {
+    let (mut target_sftp, target_path) = match scp.target.split_once(':') {
         Some((remote, path)) => {
             let (session, _) = establish_ssh_session(term, remote, scp.opts.port).await?;
             let sftp = session.sftp().await?;
@@ -55,7 +55,7 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
     };
 
     for source in &scp.sources {
-        let (source_sftp, source_path) = match source.split_once(':') {
+        let (mut source_sftp, source_path) = match source.split_once(':') {
             Some((remote, path)) => {
                 let (session, _) = establish_ssh_session(term, remote, scp.opts.port).await?;
                 let sftp = session.sftp().await?;
@@ -67,11 +67,11 @@ pub async fn do_scp_transfer(cli: &mut Opts, term: &mut Terminal) -> Result<()> 
         // TODO: show progress for each transfer
         writeln!(term, "{}", source_path)?;
 
-        match (source_sftp, &target_sftp) {
-            (None, Some(sftp)) => {
+        match (&mut source_sftp, &mut target_sftp) {
+            (None, Some(ref mut sftp)) => {
                 sftp.upload(source_path, target_path).await?;
             }
-            (Some(sftp), None) => {
+            (Some(ref mut sftp), None) => {
                 sftp.download(source_path, target_path).await?;
             }
             (None, None) => {

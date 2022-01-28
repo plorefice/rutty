@@ -18,8 +18,10 @@ use nix::NixPath;
 use ssh2::{ErrorCode, PtyModeOpcode, PtyModes};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 };
+
+const DEFAULT_BUF_SIZE: usize = 1024 * 1024;
 
 /// A reference to an established SSH session with a remote host.
 pub struct Session {
@@ -68,6 +70,7 @@ impl Session {
         Ok(Sftp {
             inner: self.inner.run(|session| session.sftp()).await?,
             session: self.inner.clone(),
+            netbuf: vec![0; DEFAULT_BUF_SIZE],
         })
     }
 
@@ -188,12 +191,13 @@ impl AsyncWrite for Channel {
 pub struct Sftp {
     inner: ssh2::Sftp,
     session: AsyncSession,
+    netbuf: Vec<u8>,
 }
 
 impl Sftp {
     /// Uploads a local file to the remote host using the SFTP protocol.
     #[async_recursion(?Send)]
-    pub async fn upload<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
+    pub async fn upload<L, R>(&mut self, local_path: L, remote_path: R) -> Result<()>
     where
         L: AsRef<Path>,
         R: AsRef<Path>,
@@ -222,14 +226,35 @@ impl Sftp {
 
         let mut remote_file = self.create(remote_path).await?;
 
-        tokio::io::copy(&mut local_file, &mut remote_file).await?;
+        let mut buf = ReadBuf::new(&mut self.netbuf);
 
-        Ok(())
+        loop {
+            // The goal here is to try to maximize the amount of bytes read from the local
+            // filesystem before sending them over the SSH connection.
+            // Since the bottleneck for this operation is either the link speed or the RTT between
+            // an SFTP chunk and its ACK, we want to send as much data as possible in a transfer.
+            while buf.filled().len() < 1024 * 1024 {
+                match local_file.read(buf.initialize_unfilled()).await {
+                    Ok(0) => break,
+                    Ok(n) => buf.advance(n),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // EOF from local file
+            if buf.filled().is_empty() {
+                return Ok(());
+            }
+
+            remote_file.write_all(buf.filled()).await?;
+
+            buf.clear();
+        }
     }
 
     /// Special handling for directory uploads.
     #[async_recursion(?Send)]
-    async fn upload_dir<L, R>(&self, local_path: L, remote_path: R) -> Result<()>
+    async fn upload_dir<L, R>(&mut self, local_path: L, remote_path: R) -> Result<()>
     where
         L: AsRef<Path>,
         R: AsRef<Path>,
@@ -275,7 +300,7 @@ impl Sftp {
 
     /// Uploads a local file to the remote host using the SFTP protocol.
     #[async_recursion(?Send)]
-    pub async fn download<L, R>(&self, remote_path: R, local_path: L) -> Result<()>
+    pub async fn download<L, R>(&mut self, remote_path: R, local_path: L) -> Result<()>
     where
         L: AsRef<Path>,
         R: AsRef<Path>,
@@ -302,14 +327,20 @@ impl Sftp {
         let mut local_file = fs::File::create(&local_path).await?;
         let mut remote_file = self.open(remote_path).await?;
 
-        tokio::io::copy(&mut remote_file, &mut local_file).await?;
-
-        Ok(())
+        loop {
+            // Same as for the upload, tokio::io::copy is abysmally slow due to very small default
+            // buffer size. Doing the read-write loop by hand is one order of magnitude faster.
+            match remote_file.read(&mut self.netbuf).await {
+                Ok(0) => return Ok(()),
+                Ok(n) => local_file.write_all(&self.netbuf[..n]).await?,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Special handling for directory uploads.
     #[async_recursion(?Send)]
-    async fn download_dir<L, R>(&self, remote_path: R, local_path: L) -> Result<()>
+    async fn download_dir<L, R>(&mut self, remote_path: R, local_path: L) -> Result<()>
     where
         L: AsRef<Path>,
         R: AsRef<Path>,
