@@ -282,7 +282,7 @@ async fn establish_ssh_session(
         Ok(channel) => channel,
         Err(_) => {
             // Show a prompt to the user
-            write!(term, "Password: ")?;
+            write!(term, "{}@{}'s password: ", &username, &address)?;
             term.flush()?;
 
             let mut password = term.input_password().await?;
