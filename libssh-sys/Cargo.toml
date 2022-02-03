@@ -1,0 +1,13 @@
+[package]
+name = "libssh-sys"
+version = "0.1.0"
+edition = "2021"
+links = "libssh"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.59"
+pkg-config = "0.3"

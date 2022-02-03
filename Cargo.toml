@@ -4,7 +4,10 @@ edition = "2021"
 name = "rutty"
 version = "0.5.2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace]
+members = [
+  "libssh-sys",
+]
 
 [dependencies]
 anyhow = "1.0"
