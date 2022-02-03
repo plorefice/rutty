@@ -2,7 +2,7 @@
 description = "A multi-protocol terminal emulator and serial console"
 edition = "2021"
 name = "rutty"
-version = "0.5.1"
+version = "0.5.2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
