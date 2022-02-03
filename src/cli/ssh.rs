@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use async_recursion::async_recursion;
+use futures::TryFutureExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use nix::unistd::{Uid, User};
 use tokio::{
@@ -277,8 +278,12 @@ async fn establish_ssh_session(
         .with_context(|| format!("Could not connect to {}", &address))?;
 
     // Authenticate with the server.
-    // Try using the agent first, and fallback on password authentication.
-    let channel = match session.authenticate_with_agent(&username).await {
+    // Try using a none authentication, followed by agent, and fallback on password authentication.
+    let channel = match session
+        .authenticate_with_none(&username)
+        .or_else(|_| session.authenticate_with_agent(&username))
+        .await
+    {
         Ok(channel) => channel,
         Err(_) => {
             // Show a prompt to the user

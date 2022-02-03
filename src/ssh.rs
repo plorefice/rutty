@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_io::Async;
 use async_recursion::async_recursion;
 use futures::ready;
@@ -37,6 +37,24 @@ impl Session {
         Ok(Self {
             inner: AsyncSession::new(session, Arc::new(Async::new(tcp)?)),
         })
+    }
+
+    /// Performs an SSH none authentication with the remote host as `username`.
+    pub async fn authenticate_with_none(&self, username: &str) -> Result<Channel> {
+        let _ = self
+            .inner
+            .run(|session| session.auth_methods(username).map(|_| ()))
+            .await;
+
+        if self
+            .inner
+            .run(|session| Ok(session.authenticated()))
+            .await?
+        {
+            self.create_channel().await
+        } else {
+            Err(anyhow!("unsupported authentication method"))
+        }
     }
 
     /// Performs an SSH agent authentication with the remote host as `username`.
