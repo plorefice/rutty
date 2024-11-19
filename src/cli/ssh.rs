@@ -252,7 +252,7 @@ where
         do_scp_download_dir(
             sftp,
             remote_path.join(&remote_file),
-            local_path.join(&file_name),
+            local_path.join(file_name),
         )
         .await?;
     }
