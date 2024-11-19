@@ -19,8 +19,8 @@ use crate::{
 mod opts;
 mod ssh;
 
-/// If this byte is detected as input, the program will quit.
-pub const ESCAPE_BYTE: u8 = 0x1d;
+/// If this byte is detected as input, enter escape mode.
+pub const ESCAPE_BYTE: u8 = 0x01;
 
 /// Utility trait which encapsulates a read/write async stream that can be unpinned.
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
@@ -77,7 +77,7 @@ pub async fn run() -> Result<()> {
     terminal.set_local_echo(cli.local_echo.into())?;
     terminal.set_canonical_mode(cli.canonical.into())?;
 
-    let mut exiter = EscapeDetector::default();
+    let mut input_mgr = InputManager::default();
 
     'repl: loop {
         let mut bufin = [0; 256];
@@ -87,12 +87,14 @@ pub async fn run() -> Result<()> {
             n = terminal.read(&mut bufin) => {
                 let n = n?;
 
-                // Break from the loop if the escape sequence is detected
-                if bufin[..n].iter().any(|&b| exiter.feed(b)) {
-                    break 'repl;
+                for evt in input_mgr.feed(&bufin[..n]) {
+                    match evt {
+                        InputEvent::Quit => break 'repl,
+                        InputEvent::Key { code } => {
+                            remote.write_all(&[code]).await?;
+                        }
+                    }
                 }
-
-                remote.write_all(&bufin[..n]).await?;
             }
             n = remote.read(&mut bufout) => {
                 let n = n?;
@@ -113,17 +115,37 @@ pub async fn run() -> Result<()> {
 
 /// Utility to recognize if the escape byte has been entered the specified number of times.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EscapeDetector(u32);
+pub struct InputManager {
+    escape: bool,
+}
 
-impl EscapeDetector {
-    /// Feeds a new byte to the detector and returns true if the specified number of consecutive
-    /// escape bytes have been detected.
-    pub fn feed(&mut self, byte: u8) -> bool {
-        if byte == ESCAPE_BYTE {
-            self.0 += 1;
-        } else {
-            self.0 = 0;
-        }
-        self.0 == 1
+impl InputManager {
+    /// Converts raw input data into input events.
+    pub fn feed<'b>(&'b mut self, bytes: &'b [u8]) -> impl Iterator<Item = InputEvent> + 'b {
+        bytes.iter().filter_map(|&b| {
+            if self.escape {
+                self.escape = false;
+
+                match b {
+                    ESCAPE_BYTE => Some(InputEvent::Key { code: ESCAPE_BYTE }),
+                    b'x' => Some(InputEvent::Quit),
+                    _ => None,
+                }
+            } else if b == ESCAPE_BYTE {
+                self.escape = true;
+                None
+            } else {
+                Some(InputEvent::Key { code: b })
+            }
+        })
     }
+}
+
+/// Events which can be produced by the input manager
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEvent {
+    /// A key was pressed.
+    Key { code: u8 },
+    /// Exit was requested.
+    Quit,
 }
