@@ -2,7 +2,10 @@
 
 use std::{
     io::{self, Read, Write},
-    os::unix::prelude::{AsRawFd, RawFd},
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::prelude::{AsRawFd, RawFd},
+    },
     path::Path,
     pin::Pin,
     task::{Context, Poll},
@@ -40,9 +43,8 @@ impl SerialPort {
         let tty = TtyDevice::open(path)?;
 
         // Make the file descriptor non-blocking
-        // SAFETY: the bitfield retrieved with F_GETFL is assumed to be always valid.
         let fd = tty.as_raw_fd();
-        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
+        let flags = OFlag::from_bits_retain(fcntl::fcntl(fd, FcntlArg::F_GETFL)?);
         fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
 
         let mut port = Self {
@@ -61,40 +63,40 @@ impl SerialPort {
 
     /// Configures the baud rate used for communication on this serial port.
     pub fn set_baud_rate(&mut self, baud_rate: u32) -> io::Result<()> {
-        let fd = self.inner.as_raw_fd();
-        let mut termios = Termios::from_raw_fd(fd)?;
+        let fd = &self.inner;
+        let mut termios = Termios::from_fd(fd)?;
         termios.set_baud_rate(baud_rate)?;
         termios.apply(fd)
     }
 
     /// Configures the number of data bits used for communication on this serial port.
     pub fn set_data_bits(&mut self, data_bits: DataBits) -> io::Result<()> {
-        let fd = self.inner.as_raw_fd();
-        let mut termios = Termios::from_raw_fd(fd)?;
+        let fd = &self.inner;
+        let mut termios = Termios::from_fd(fd)?;
         termios.set_data_bits(data_bits);
         termios.apply(fd)
     }
 
     /// Configures the number of stop bits used for communication on this serial port.
     pub fn set_stop_bits(&mut self, stop_bits: StopBits) -> io::Result<()> {
-        let fd = self.inner.as_raw_fd();
-        let mut termios = Termios::from_raw_fd(fd)?;
+        let fd = &self.inner;
+        let mut termios = Termios::from_fd(fd)?;
         termios.set_stop_bits(stop_bits);
         termios.apply(fd)
     }
 
     /// Configures the parity check used for communication on this serial port.
     pub fn set_parity(&mut self, parity: Parity) -> io::Result<()> {
-        let fd = self.inner.as_raw_fd();
-        let mut termios = Termios::from_raw_fd(fd)?;
+        let fd = &self.inner;
+        let mut termios = Termios::from_fd(fd)?;
         termios.set_parity(parity);
         termios.apply(fd)
     }
 
     /// Configures the flow control used for communication on this serial port.
     pub fn set_flow_control(&mut self, flow_control: FlowControl) -> io::Result<()> {
-        let fd = self.inner.as_raw_fd();
-        let mut termios = Termios::from_raw_fd(fd)?;
+        let fd = &self.inner;
+        let mut termios = Termios::from_fd(fd)?;
         termios.set_flow_control(flow_control);
         termios.apply(fd)
     }
@@ -245,18 +247,20 @@ pub enum FlowControl {
 
 #[derive(Debug)]
 struct TtyDevice {
-    fd: RawFd,
+    fd: OwnedFd,
 }
 
 impl TtyDevice {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let fd = fcntl::open(
-            path.as_ref(),
-            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
-            Mode::empty(),
-        )?;
+        let fd = unsafe {
+            OwnedFd::from_raw_fd(fcntl::open(
+                path.as_ref(),
+                OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
+                Mode::empty(),
+            )?)
+        };
 
-        let mut termios = Termios::from_raw_fd(fd)?;
+        let mut termios = Termios::from_fd(&fd)?;
 
         // Set control flags required for a TTY device
         termios.as_mut().control_flags |= ControlFlags::CREAD | ControlFlags::CLOCAL;
@@ -265,41 +269,34 @@ impl TtyDevice {
         termios.make_raw();
 
         // Apply settings
-        termios.apply(fd)?;
+        termios.apply(&fd)?;
 
         // Clear O_NONBLOCK flag.
-        // SAFETY: the bitfield retrieved with F_GETFL is assumed to be always valid.
-        let flags = unsafe { OFlag::from_bits_unchecked(fcntl::fcntl(fd, FcntlArg::F_GETFL)?) };
-        fcntl::fcntl(fd, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
+        let flags = OFlag::from_bits_retain(fcntl::fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL)?);
+        fcntl::fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
 
         Ok(Self { fd })
     }
 }
 
-impl Drop for TtyDevice {
-    fn drop(&mut self) {
-        let _ = unistd::close(self.fd);
-    }
-}
-
 impl AsRawFd for TtyDevice {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
 impl io::Read for TtyDevice {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        unistd::read(self.fd, buf).map_err(io::Error::from)
+        unistd::read(self.as_raw_fd(), buf).map_err(io::Error::from)
     }
 }
 
 impl io::Write for TtyDevice {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        unistd::write(self.fd, buf).map_err(io::Error::from)
+        unistd::write(&self.fd, buf).map_err(io::Error::from)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        sys::termios::tcdrain(self.fd).map_err(io::Error::from)
+        sys::termios::tcdrain(&self.fd).map_err(io::Error::from)
     }
 }

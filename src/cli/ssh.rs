@@ -424,9 +424,11 @@ where
 fn default_progress_bar<S: ToString>(msg: S, size: u64) -> ProgressBar {
     let pb = ProgressBar::new(size);
     pb.set_style(
-        ProgressStyle::default_bar().template(
-            "{wide_msg} {percent:>7}% {bytes:>10} {binary_bytes_per_sec:>12}    eta {eta}",
-        ),
+        ProgressStyle::default_bar()
+            .template(
+                "{wide_msg} {percent:>7}% {bytes:>10} {binary_bytes_per_sec:>12}    eta {eta}",
+            )
+            .unwrap(),
     );
     pb.set_message(msg.to_string());
     pb

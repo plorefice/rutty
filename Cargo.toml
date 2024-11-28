@@ -8,15 +8,18 @@ version = "0.5.2"
 
 [dependencies]
 anyhow = "1.0"
-async-io = "1.6"
-async-recursion = "1.0"
+async-io = "2.4"
+async-recursion = "1.1"
 futures = "0.3"
-indicatif = "0.16"
-nix = "0.23"
+indicatif = "0.17"
 ssh2 = "0.9"
 structopt = "0.3"
-zeroize = "1.5"
+zeroize = "1.8"
+
+[dependencies.nix]
+features = ["fs", "ioctl", "term", "user"]
+version = "0.29"
 
 [dependencies.tokio]
 features = ["rt", "fs", "io-std", "io-util", "net", "macros"]
-version = "1.15"
+version = "1.41"

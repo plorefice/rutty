@@ -1,6 +1,6 @@
 //! Types for working with raw file descriptor options.
 
-use std::{io, os::unix::prelude::AsRawFd};
+use std::{io, os::fd::AsFd};
 
 use nix::sys::{
     self,
@@ -17,15 +17,15 @@ pub struct Termios {
 
 impl Termios {
     /// Retrieves the parameters associated with a file descriptor.
-    pub fn from_raw_fd<F: AsRawFd>(fd: F) -> io::Result<Self> {
+    pub fn from_fd<F: AsFd>(fd: F) -> io::Result<Self> {
         Ok(Self {
-            inner: sys::termios::tcgetattr(fd.as_raw_fd())?,
+            inner: sys::termios::tcgetattr(fd)?,
         })
     }
 
     /// Immediately applies the options in `self` a file descriptor.
-    pub fn apply<F: AsRawFd>(&self, fd: F) -> io::Result<()> {
-        let fd = fd.as_raw_fd();
+    pub fn apply<F: AsFd>(&self, fd: F) -> io::Result<()> {
+        let fd = fd.as_fd();
 
         sys::termios::tcflush(fd, FlushArg::TCIFLUSH)?;
         sys::termios::tcsetattr(fd, SetArg::TCSANOW, &self.inner)?;
