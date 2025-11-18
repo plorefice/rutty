@@ -35,7 +35,7 @@ where
 
         // For the time being, do not try working with anything other than PTYs.
         if !unistd::isatty(fd.as_raw_fd())? {
-            return Err(io::Error::new(io::ErrorKind::Other, "not a TTY"));
+            return Err(io::Error::other("not a TTY"));
         }
 
         // Push the current state in order to restore it on drop
@@ -170,7 +170,14 @@ where
     O: Write + AsFd,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.output.write(buf)
+        for &b in buf {
+            if b == b'\n' {
+                self.output.write(b"\r")?;
+            }
+            self.output.write(&[b])?;
+        }
+
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
